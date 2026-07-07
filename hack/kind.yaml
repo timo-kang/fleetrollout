@@ -1,0 +1,11 @@
+# Local multi-node cluster for FleetRollout dev/e2e.
+#   kind create cluster --config hack/kind.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: fleetrollout
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker

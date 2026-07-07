@@ -1,9 +1,15 @@
 apiVersion: fleet.fleetrollout.io/v1alpha1
 kind: FleetRollout
 metadata:
-  labels:
-    app.kubernetes.io/name: fleetrollout
-    app.kubernetes.io/managed-by: kustomize
-  name: fleetrollout-sample
+  name: camera-agent
 spec:
-  # TODO(user): Add fields here
+  targetSelector:
+    matchLabels:
+      fleet-group: field-robots
+  image: registry.example.com/camera-agent:v2.3.0
+  waveSize: "25%"
+  rollbackPolicy: OnFailure
+  healthGate:
+    prometheusURL: http://prometheus.monitoring:9090
+    query: 'min(up{job="camera-agent"}) == 1'
+    timeoutSeconds: 300
