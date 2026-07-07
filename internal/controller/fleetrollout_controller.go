@@ -18,37 +18,50 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	fleetv1alpha1 "github.com/timo-kang/fleetrollout/api/v1alpha1"
 )
 
 const (
-	// agentContainer is the single container the MVP controller manages in the owned DaemonSet.
 	agentContainer = "agent"
-	// ownerLabel ties DaemonSet pods back to their FleetRollout.
-	ownerLabel = "fleetrollout.fleet.fleetrollout.io/owner"
+	ownerLabel     = "fleetrollout.fleet.fleetrollout.io/owner"
+	annPrefix      = "fleetrollout.fleet.fleetrollout.io/"
 
-	requeueConverging = 15 * time.Second // waiting for DS pods to recreate / become Ready
-	requeueActed      = 10 * time.Second // just deleted a wave's stale pods
+	requeueConverging = 15 * time.Second
+	requeueActed      = 10 * time.Second
+	requeueGate       = 15 * time.Second
+	promQLTimeout     = 5 * time.Second
 )
 
 // FleetRolloutReconciler reconciles a FleetRollout object
 type FleetRolloutReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// HTTP is used to evaluate PromQL health gates; overridable in tests.
+	HTTP *http.Client
 }
 
 // +kubebuilder:rbac:groups=fleet.fleetrollout.io,resources=fleetrollouts,verbs=get;list;watch;create;update;patch;delete
@@ -59,8 +72,7 @@ type FleetRolloutReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // Reconcile implements the level-triggered rollout loop. See docs/reconcile-design.md.
-// MVP slice: owned DaemonSet (OnDelete) + deterministic wave partitioning + image-based
-// updated/stale derivation + per-wave stale-pod deletion + Done. Health gate & rollback: TODO.
+// Slice 2a: adds PromQL health-gated wave promotion + Node watch. (Rollback: slice 2b.)
 func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -69,10 +81,11 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !fr.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil // ownerRef GC removes the DaemonSet; no finalizer in MVP
+		return ctrl.Result{}, nil
 	}
-
+	annChanged := false
 	desiredImage := fr.Spec.Image
+	imgKey := shortHash(desiredImage)
 
 	// ---- 1. Ensure the owned DaemonSet matches spec (idempotent) ----
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: fr.Name, Namespace: fr.Namespace}}
@@ -83,16 +96,13 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		ds.Spec.UpdateStrategy = appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType}
 		ds.Spec.Template.ObjectMeta.Labels = labels
 		ds.Spec.Template.Spec.NodeSelector = fr.Spec.TargetSelector.MatchLabels
-		ds.Spec.Template.Spec.Containers = []corev1.Container{{
-			Name:  agentContainer,
-			Image: desiredImage,
-		}}
+		ds.Spec.Template.Spec.Containers = []corev1.Container{{Name: agentContainer, Image: desiredImage}}
 		return controllerutil.SetControllerReference(&fr, ds, r.Scheme)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// ---- 2. Observe: resolve target nodes (Ready only), deterministically partitioned ----
+	// ---- 2. Observe target nodes (Ready only), deterministically ordered ----
 	sel, err := metav1.LabelSelectorAsSelector(&fr.Spec.TargetSelector)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -107,16 +117,15 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			nodeNames = append(nodeNames, nodeList.Items[i].Name)
 		}
 	}
-	sort.Strings(nodeNames) // stable, restart-safe ordering
+	sort.Strings(nodeNames)
 	n := len(nodeNames)
-
 	if n == 0 {
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: "Degraded", Status: metav1.ConditionTrue, Reason: "NoTargetNodes",
 			Message: "no Ready nodes match spec.targetSelector",
 		})
 		fr.Status.Phase = "Progressing"
-		return r.finish(ctx, &fr, ctrl.Result{RequeueAfter: requeueConverging})
+		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
 	}
 
 	// ---- 3. Pods owned by the DS, indexed by node ----
@@ -127,12 +136,10 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	podByNode := make(map[string]*corev1.Pod, len(podList.Items))
 	for i := range podList.Items {
-		p := &podList.Items[i]
-		if p.Spec.NodeName != "" {
+		if p := &podList.Items[i]; p.Spec.NodeName != "" {
 			podByNode[p.Spec.NodeName] = p
 		}
 	}
-	// updated(node): pod exists (not terminating), runs desiredImage, and is Ready.
 	updated := func(node string) bool {
 		p := podByNode[node]
 		return p != nil && p.DeletionTimestamp.IsZero() && len(p.Spec.Containers) > 0 &&
@@ -147,7 +154,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	fr.Status.UpdatedNodes = int32(updatedCount)
 
-	// waveSize resolution (count or percent), ceil, clamp >= 1.
+	// waveSize resolution (count/percent, ceil, clamp >= 1)
 	ws := fr.Spec.WaveSize
 	if ws.StrVal == "" && ws.IntVal == 0 {
 		ws = intstr.FromString("20%")
@@ -162,10 +169,29 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	totalWaves := (n + size - 1) / size
 	fr.Status.TotalWaves = int32(totalWaves)
 
-	// ---- 4. Terminal: everything updated ----
+	waveFullyUpdated := func(w int) bool {
+		start, end := w*size, min((w+1)*size, n)
+		for _, node := range nodeNames[start:end] {
+			if !updated(node) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// ---- 4. Terminal: everything updated → (final health gate) → Done ----
 	if updatedCount == n {
+		if fr.Spec.HealthGate != nil {
+			d := r.gate(ctx, log, &fr, totalWaves-1, imgKey, &annChanged)
+			if !d.promote {
+				return r.finishGate(ctx, &fr, annChanged, d)
+			}
+		}
 		fr.Status.Phase = "Done"
 		fr.Status.CurrentWave = int32(totalWaves)
+		if fr.Annotations[annPrefix+"last-good-image"] != desiredImage {
+			setAnn(&fr, "last-good-image", desiredImage, &annChanged)
+		}
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: "Ready", Status: metav1.ConditionTrue, Reason: "RolloutComplete",
 			Message: "all target nodes updated and Ready",
@@ -173,21 +199,13 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: "Progressing", Status: metav1.ConditionFalse, Reason: "RolloutComplete",
 		})
-		return r.finish(ctx, &fr, ctrl.Result{})
+		return r.finish(ctx, &fr, annChanged, ctrl.Result{})
 	}
 
-	// ---- 5. Derive current wave = first wave containing a non-updated node ----
+	// ---- 5. Current wave = first wave with a non-updated node ----
 	curWave := 0
 	for w := 0; w < totalWaves; w++ {
-		start, end := w*size, min((w+1)*size, n)
-		done := true
-		for _, node := range nodeNames[start:end] {
-			if !updated(node) {
-				done = false
-				break
-			}
-		}
-		if !done {
+		if !waveFullyUpdated(w) {
 			curWave = w
 			break
 		}
@@ -195,23 +213,26 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	fr.Status.CurrentWave = int32(curWave)
 	fr.Status.Phase = "Progressing"
 
+	// ---- 5b. Health gate: promotion from wave (curWave-1) must be approved before we touch curWave ----
+	if curWave > 0 && fr.Spec.HealthGate != nil {
+		d := r.gate(ctx, log, &fr, curWave-1, imgKey, &annChanged)
+		if !d.promote {
+			return r.finishGate(ctx, &fr, annChanged, d)
+		}
+	}
+
 	// ---- 6. Act on the current wave ----
 	start, end := curWave*size, min((curWave+1)*size, n)
-	waveNodes := nodeNames[start:end]
-
-	converging := false // pod already on desiredImage but not yet Ready
 	var stalePods []*corev1.Pod
-	for _, node := range waveNodes {
+	for _, node := range nodeNames[start:end] {
 		p := podByNode[node]
 		switch {
 		case p == nil:
-			converging = true // DS will schedule a pod (current template = desiredImage); wait
+			// DS will schedule with current template (desiredImage); wait
 		case !p.DeletionTimestamp.IsZero():
-			converging = true // already terminating; DS is recreating it — don't re-delete
+			// already terminating; DS is recreating it
 		case len(p.Spec.Containers) > 0 && p.Spec.Containers[0].Image != desiredImage:
-			stalePods = append(stalePods, p) // old image → delete so DS recreates on new image
-		case !podReady(p):
-			converging = true // right image, not Ready yet
+			stalePods = append(stalePods, p)
 		}
 	}
 
@@ -224,27 +245,158 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		log.Info("advanced wave: deleted stale pods", "wave", curWave, "count", len(stalePods))
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: "Progressing", Status: metav1.ConditionTrue, Reason: "AdvancingWave",
-			Message: "deleting stale pods in current wave to trigger update",
+			Message: fmt.Sprintf("rolling wave %d (%d pods)", curWave, len(stalePods)),
 		})
-		return r.finish(ctx, &fr, ctrl.Result{RequeueAfter: requeueActed})
+		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueActed})
 	}
 
-	// converging (pods recreating / becoming Ready)
 	apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 		Type: "WaveReady", Status: metav1.ConditionFalse, Reason: "PodsPending",
-		Message: "waiting for current wave pods to become Ready",
+		Message: fmt.Sprintf("waiting for wave %d pods to become Ready", curWave),
 	})
-	_ = converging
-	// NOTE: health gate + promotion + rollback land in slice 2 (docs/reconcile-design.md §5–6).
-	return r.finish(ctx, &fr, ctrl.Result{RequeueAfter: requeueConverging})
+	return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
 }
 
-// finish writes the status subresource and returns the given result.
-func (r *FleetRolloutReconciler) finish(ctx context.Context, fr *fleetv1alpha1.FleetRollout, res ctrl.Result) (ctrl.Result, error) {
+// gateDecision is the outcome of evaluating a wave's health gate.
+type gateDecision struct {
+	promote bool // gate passed (or already latched) → proceed
+	paused  bool // gate timed out → park in Paused (slice 2b: OnFailure → rollback)
+	res     ctrl.Result
+}
+
+// gate evaluates (and latches) the health gate for a completed wave, keyed by image+wave.
+func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1alpha1.FleetRollout, wave int, imgKey string, annChanged *bool) gateDecision {
+	okKey := fmt.Sprintf("gate-ok-%s-w%d", imgKey, wave)
+	if fr.Annotations[annPrefix+okKey] == "1" {
+		return gateDecision{promote: true}
+	}
+	gate := fr.Spec.HealthGate
+	startKey := fmt.Sprintf("gate-start-%s-w%d", imgKey, wave)
+	startStr := fr.Annotations[annPrefix+startKey]
+	if startStr == "" {
+		startStr = time.Now().UTC().Format(time.RFC3339)
+		setAnn(fr, startKey, startStr, annChanged)
+	}
+
+	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, gate.Query)
+	if healthy {
+		setAnn(fr, okKey, "1", annChanged)
+		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+			Type: "HealthGatePassed", Status: metav1.ConditionTrue, Reason: "Passed",
+			Message: fmt.Sprintf("wave %d health gate passed", wave),
+		})
+		log.Info("health gate passed", "wave", wave)
+		return gateDecision{promote: true, res: ctrl.Result{Requeue: true}}
+	}
+
+	start, _ := time.Parse(time.RFC3339, startStr)
+	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
+	if timeout == 0 {
+		timeout = 300 * time.Second
+	}
+	if time.Since(start) >= timeout {
+		// Slice 2a: park in Paused. Slice 2b: rollbackPolicy OnFailure → trigger rollback here.
+		fr.Status.Phase = "Paused"
+		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+			Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: "Timeout",
+			Message: fmt.Sprintf("wave %d health gate timed out after %s", wave, timeout),
+		})
+		log.Info("health gate timed out", "wave", wave)
+		return gateDecision{paused: true}
+	}
+
+	reason := "Evaluating"
+	if !reachable {
+		reason = "PrometheusUnreachable"
+	}
+	apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+		Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: reason,
+		Message: fmt.Sprintf("wave %d health gate not yet passed", wave),
+	})
+	return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
+}
+
+// evalPromQL runs an instant query; healthy = >=1 sample and every sample value > 0.
+func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query string) (healthy, reachable bool) {
+	cl := r.HTTP
+	if cl == nil {
+		cl = &http.Client{Timeout: promQLTimeout}
+	}
+	u := fmt.Sprintf("%s/api/v1/query?query=%s", base, url.QueryEscape(query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, false
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, true
+	}
+	var pr struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				Value []interface{} `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return false, true
+	}
+	if pr.Status != "success" || len(pr.Data.Result) == 0 {
+		return false, true
+	}
+	for _, s := range pr.Data.Result {
+		if len(s.Value) != 2 {
+			return false, true
+		}
+		str, ok := s.Value[1].(string)
+		if !ok {
+			return false, true
+		}
+		v, err := strconv.ParseFloat(str, 64)
+		if err != nil || v <= 0 {
+			return false, true
+		}
+	}
+	return true, true
+}
+
+func (r *FleetRolloutReconciler) finishGate(ctx context.Context, fr *fleetv1alpha1.FleetRollout, annChanged bool, d gateDecision) (ctrl.Result, error) {
+	return r.finish(ctx, fr, annChanged, d.res)
+}
+
+// finish persists annotations (if changed) then the status subresource.
+func (r *FleetRolloutReconciler) finish(ctx context.Context, fr *fleetv1alpha1.FleetRollout, annChanged bool, res ctrl.Result) (ctrl.Result, error) {
+	if annChanged {
+		if err := r.Update(ctx, fr); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if err := r.Status().Update(ctx, fr); err != nil {
 		return ctrl.Result{}, err
 	}
 	return res, nil
+}
+
+func setAnn(fr *fleetv1alpha1.FleetRollout, key, val string, changed *bool) {
+	if fr.Annotations == nil {
+		fr.Annotations = map[string]string{}
+	}
+	full := annPrefix + key
+	if fr.Annotations[full] != val {
+		fr.Annotations[full] = val
+		*changed = true
+	}
+}
+
+func shortHash(s string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return strconv.FormatUint(uint64(h.Sum32()), 16)
 }
 
 func nodeReady(node *corev1.Node) bool {
@@ -268,12 +420,38 @@ func podReady(pod *corev1.Pod) bool {
 	return false
 }
 
+// rolloutsForNode maps a Node event to the FleetRollouts whose selector matches it.
+func (r *FleetRolloutReconciler) rolloutsForNode(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list fleetv1alpha1.FleetRolloutList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	nodeLabels := labels.Set(obj.GetLabels())
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		fr := &list.Items[i]
+		s, err := metav1.LabelSelectorAsSelector(&fr.Spec.TargetSelector)
+		if err != nil {
+			continue
+		}
+		if s.Matches(nodeLabels) {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: fr.Name, Namespace: fr.Namespace}})
+		}
+	}
+	return reqs
+}
+
+// logr is the minimal logging interface used by gate (satisfied by logr.Logger).
+type logr = interface {
+	Info(msg string, keysAndValues ...any)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *FleetRolloutReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1alpha1.FleetRollout{}).
 		Owns(&appsv1.DaemonSet{}).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.rolloutsForNode)).
 		Named("fleetrollout").
 		Complete(r)
-	// TODO(slice 2): Watches(&corev1.Node{}, mapNodeToRollouts) so node add/remove re-triggers.
 }
