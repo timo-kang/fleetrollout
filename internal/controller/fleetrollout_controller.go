@@ -132,10 +132,10 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			podByNode[p.Spec.NodeName] = p
 		}
 	}
-	// updated(node): pod exists, runs desiredImage, and is Ready.
+	// updated(node): pod exists (not terminating), runs desiredImage, and is Ready.
 	updated := func(node string) bool {
 		p := podByNode[node]
-		return p != nil && len(p.Spec.Containers) > 0 &&
+		return p != nil && p.DeletionTimestamp.IsZero() && len(p.Spec.Containers) > 0 &&
 			p.Spec.Containers[0].Image == desiredImage && podReady(p)
 	}
 
@@ -206,6 +206,8 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		switch {
 		case p == nil:
 			converging = true // DS will schedule a pod (current template = desiredImage); wait
+		case !p.DeletionTimestamp.IsZero():
+			converging = true // already terminating; DS is recreating it — don't re-delete
 		case len(p.Spec.Containers) > 0 && p.Spec.Containers[0].Image != desiredImage:
 			stalePods = append(stalePods, p) // old image → delete so DS recreates on new image
 		case !podReady(p):
