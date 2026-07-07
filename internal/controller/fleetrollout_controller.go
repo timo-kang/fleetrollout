@@ -84,7 +84,24 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 	annChanged := false
+	rollingBack := fr.Annotations[annPrefix+"rolling-back"] == "1"
+	rollbackFrom := fr.Annotations[annPrefix+"rollback-from"]
+	lastGood := fr.Annotations[annPrefix+"last-good-image"]
+
+	// A new spec.image supersedes an in-flight or finished rollback → abandon it and roll forward.
+	if rollingBack && fr.Spec.Image != rollbackFrom {
+		delAnn(&fr, "rolling-back", &annChanged)
+		delAnn(&fr, "rollback-from", &annChanged)
+		rollingBack = false
+	}
+	if rollingBack && lastGood == "" {
+		rollingBack = false // nothing to roll back to; fall through to normal path
+	}
+
 	desiredImage := fr.Spec.Image
+	if rollingBack {
+		desiredImage = lastGood
+	}
 	imgKey := shortHash(desiredImage)
 
 	// ---- 1. Ensure the owned DaemonSet matches spec (idempotent) ----
@@ -154,6 +171,52 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	fr.Status.UpdatedNodes = int32(updatedCount)
 
+	// ---- Rollback path: revert to last-good image, all at once (no waves, no gate) ----
+	if rollingBack {
+		var stale []*corev1.Pod
+		for _, node := range nodeNames {
+			p := podByNode[node]
+			if p != nil && p.DeletionTimestamp.IsZero() && len(p.Spec.Containers) > 0 &&
+				p.Spec.Containers[0].Image != desiredImage {
+				stale = append(stale, p)
+			}
+		}
+		if len(stale) > 0 {
+			for _, p := range stale {
+				if err := r.Delete(ctx, p); err != nil && client.IgnoreNotFound(err) != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			log.Info("rolling back: deleted bad-image pods", "count", len(stale), "to", desiredImage)
+			fr.Status.Phase = "Progressing"
+			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+				Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "InProgress",
+				Message: fmt.Sprintf("rolling back to last-good image %s", desiredImage),
+			})
+			return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueActed})
+		}
+		if updatedCount == n {
+			fr.Status.Phase = "RolledBack"
+			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+				Type: "RollingBack", Status: metav1.ConditionFalse, Reason: "Completed",
+				Message: "rolled back to last-good image",
+			})
+			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+				Type: "Ready", Status: metav1.ConditionFalse, Reason: "RolledBack",
+			})
+			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+				Type: "Degraded", Status: metav1.ConditionTrue, Reason: "RolledBack",
+				Message: "rolled back after health-gate failure; edit spec.image to retry",
+			})
+			return r.finish(ctx, &fr, annChanged, ctrl.Result{}) // sticky until spec.image changes
+		}
+		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+			Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "InProgress",
+			Message: "waiting for rolled-back pods to become Ready",
+		})
+		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
+	}
+
 	// waveSize resolution (count/percent, ceil, clamp >= 1)
 	ws := fr.Spec.WaveSize
 	if ws.StrVal == "" && ws.IntVal == 0 {
@@ -184,7 +247,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if fr.Spec.HealthGate != nil {
 			d := r.gate(ctx, log, &fr, totalWaves-1, imgKey, &annChanged)
 			if !d.promote {
-				return r.finishGate(ctx, &fr, annChanged, d)
+				return r.onGateHold(ctx, &fr, annChanged, d)
 			}
 		}
 		fr.Status.Phase = "Done"
@@ -217,7 +280,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if curWave > 0 && fr.Spec.HealthGate != nil {
 		d := r.gate(ctx, log, &fr, curWave-1, imgKey, &annChanged)
 		if !d.promote {
-			return r.finishGate(ctx, &fr, annChanged, d)
+			return r.onGateHold(ctx, &fr, annChanged, d)
 		}
 	}
 
@@ -259,9 +322,10 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // gateDecision is the outcome of evaluating a wave's health gate.
 type gateDecision struct {
-	promote bool // gate passed (or already latched) → proceed
-	paused  bool // gate timed out → park in Paused (slice 2b: OnFailure → rollback)
-	res     ctrl.Result
+	promote  bool // gate passed (or already latched) → proceed
+	paused   bool // gate timed out, rollbackPolicy=Never (or no known-good) → park in Paused
+	rollback bool // gate timed out, rollbackPolicy=OnFailure with a known-good image → roll back
+	res      ctrl.Result
 }
 
 // gate evaluates (and latches) the health gate for a completed wave, keyed by image+wave.
@@ -295,13 +359,20 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		timeout = 300 * time.Second
 	}
 	if time.Since(start) >= timeout {
-		// Slice 2a: park in Paused. Slice 2b: rollbackPolicy OnFailure → trigger rollback here.
+		lg := fr.Annotations[annPrefix+"last-good-image"]
+		if fr.Spec.RollbackPolicy == fleetv1alpha1.RollbackOnFailure && lg != "" && lg != fr.Spec.Image {
+			log.Info("health gate timed out → rolling back", "wave", wave, "lastGood", lg)
+			return gateDecision{rollback: true}
+		}
 		fr.Status.Phase = "Paused"
+		reason, msg := "Timeout", fmt.Sprintf("wave %d health gate timed out after %s", wave, timeout)
+		if fr.Spec.RollbackPolicy == fleetv1alpha1.RollbackOnFailure && lg == "" {
+			reason, msg = "NoKnownGoodImage", "health gate timed out and no known-good image to roll back to"
+		}
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: "Timeout",
-			Message: fmt.Sprintf("wave %d health gate timed out after %s", wave, timeout),
+			Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: reason, Message: msg,
 		})
-		log.Info("health gate timed out", "wave", wave)
+		log.Info("health gate timed out → paused", "wave", wave)
 		return gateDecision{paused: true}
 	}
 
@@ -365,7 +436,18 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 	return true, true
 }
 
-func (r *FleetRolloutReconciler) finishGate(ctx context.Context, fr *fleetv1alpha1.FleetRollout, annChanged bool, d gateDecision) (ctrl.Result, error) {
+// onGateHold handles a non-promoting gate decision: trigger rollback (OnFailure) or wait (evaluating/Paused).
+func (r *FleetRolloutReconciler) onGateHold(ctx context.Context, fr *fleetv1alpha1.FleetRollout, annChanged bool, d gateDecision) (ctrl.Result, error) {
+	if d.rollback {
+		setAnn(fr, "rolling-back", "1", &annChanged)
+		setAnn(fr, "rollback-from", fr.Spec.Image, &annChanged)
+		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+			Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "HealthGateTimeout",
+			Message: "health gate failed; rolling back to last-good image",
+		})
+		fr.Status.Phase = "Progressing"
+		return r.finish(ctx, fr, annChanged, ctrl.Result{Requeue: true})
+	}
 	return r.finish(ctx, fr, annChanged, d.res)
 }
 
@@ -390,6 +472,16 @@ func setAnn(fr *fleetv1alpha1.FleetRollout, key, val string, changed *bool) {
 	if fr.Annotations[full] != val {
 		fr.Annotations[full] = val
 		*changed = true
+	}
+}
+
+func delAnn(fr *fleetv1alpha1.FleetRollout, key string, changed *bool) {
+	full := annPrefix + key
+	if fr.Annotations != nil {
+		if _, ok := fr.Annotations[full]; ok {
+			delete(fr.Annotations, full)
+			*changed = true
+		}
 	}
 }
 
