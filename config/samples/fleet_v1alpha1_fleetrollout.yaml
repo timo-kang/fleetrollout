@@ -1,0 +1,9 @@
+apiVersion: fleet.fleetrollout.io/v1alpha1
+kind: FleetRollout
+metadata:
+  labels:
+    app.kubernetes.io/name: fleetrollout
+    app.kubernetes.io/managed-by: kustomize
+  name: fleetrollout-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,240 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: fleetrollouts.fleet.fleetrollout.io
+spec:
+  group: fleet.fleetrollout.io
+  names:
+    kind: FleetRollout
+    listKind: FleetRolloutList
+    plural: fleetrollouts
+    singular: fleetrollout
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.currentWave
+      name: Wave
+      type: integer
+    - jsonPath: .status.updatedNodes
+      name: Updated
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: FleetRollout is the Schema for the fleetrollouts API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of FleetRollout
+            properties:
+              healthGate:
+                description: healthGate optionally gates promotion to the next wave
+                  on a PromQL check.
+                properties:
+                  prometheusURL:
+                    description: prometheusURL is the base URL of the Prometheus server
+                      to query.
+                    type: string
+                  query:
+                    description: query is a PromQL expression; the wave is healthy
+                      when it returns a truthy, non-empty result.
+                    type: string
+                  timeoutSeconds:
+                    default: 300
+                    description: timeoutSeconds is how long to wait for the gate to
+                      pass before failing the wave.
+                    format: int32
+                    type: integer
+                required:
+                - prometheusURL
+                - query
+                type: object
+              image:
+                description: image is the container image to progressively roll out
+                  across the fleet.
+                type: string
+              rollbackPolicy:
+                default: OnFailure
+                description: rollbackPolicy controls whether a failed wave triggers
+                  automatic rollback.
+                enum:
+                - OnFailure
+                - Never
+                type: string
+              targetSelector:
+                description: targetSelector selects the fleet's target nodes (e.g.
+                  edge/robot nodes) by label.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              waveSize:
+                anyOf:
+                - type: integer
+                - type: string
+                default: 20%
+                description: |-
+                  waveSize is the number of nodes updated per wave — a count (e.g. 5) or a
+                  percentage of the selected fleet (e.g. "20%").
+                x-kubernetes-int-or-string: true
+            required:
+            - image
+            - targetSelector
+            type: object
+          status:
+            description: status defines the observed state of FleetRollout
+            properties:
+              conditions:
+                description: |-
+                  conditions represent the current state of the FleetRollout resource
+                  (e.g. Progressing, Degraded). Status is one of True, False, or Unknown.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              currentWave:
+                description: currentWave is the 0-based index of the wave currently
+                  being processed.
+                format: int32
+                type: integer
+              phase:
+                description: 'phase is a high-level summary: Progressing, Paused,
+                  RolledBack, or Done.'
+                type: string
+              totalWaves:
+                description: totalWaves is the total number of waves planned for this
+                  rollout.
+                format: int32
+                type: integer
+              updatedNodes:
+                description: updatedNodes is the number of nodes successfully updated
+                  so far.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

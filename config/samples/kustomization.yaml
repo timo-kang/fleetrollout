@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- fleet_v1alpha1_fleetrollout.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
