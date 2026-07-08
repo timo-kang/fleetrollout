@@ -20,19 +20,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-// promResult builds a Prometheus /api/v1/query success body with one scalar-ish sample per value.
+// promSuccess builds a Prometheus /api/v1/query success body with one sample per value.
 func promSuccess(values ...string) string {
-	body := `{"status":"success","data":{"resultType":"vector","result":[`
+	samples := make([]string, len(values))
 	for i, v := range values {
-		if i > 0 {
-			body += ","
-		}
-		body += `{"metric":{},"value":[1700000000,"` + v + `"]}`
+		samples[i] = `{"metric":{},"value":[1700000000,"` + v + `"]}`
 	}
-	return body + `]}}`
+	return `{"status":"success","data":{"resultType":"vector","result":[` + strings.Join(samples, ",") + `]}}`
 }
 
 func TestEvalPromQL(t *testing.T) {

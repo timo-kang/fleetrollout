@@ -23,7 +23,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -54,6 +54,12 @@ const (
 	requeueActed      = 10 * time.Second
 	requeueGate       = 15 * time.Second
 	promQLTimeout     = 5 * time.Second
+
+	// phase / condition-type string constants
+	strProgressing = "Progressing"
+	strRolledBack  = "RolledBack"
+	strRollingBack = "RollingBack"
+	strHealthGate  = "HealthGatePassed"
 )
 
 // FleetRolloutReconciler reconciles a FleetRollout object
@@ -111,7 +117,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		ds.Labels = labels
 		ds.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		ds.Spec.UpdateStrategy = appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType}
-		ds.Spec.Template.ObjectMeta.Labels = labels
+		ds.Spec.Template.Labels = labels
 		ds.Spec.Template.Spec.NodeSelector = fr.Spec.TargetSelector.MatchLabels
 		ds.Spec.Template.Spec.Containers = []corev1.Container{{Name: agentContainer, Image: desiredImage}}
 		return controllerutil.SetControllerReference(&fr, ds, r.Scheme)
@@ -134,14 +140,14 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			nodeNames = append(nodeNames, nodeList.Items[i].Name)
 		}
 	}
-	sort.Strings(nodeNames)
+	slices.Sort(nodeNames)
 	n := len(nodeNames)
 	if n == 0 {
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: "Degraded", Status: metav1.ConditionTrue, Reason: "NoTargetNodes",
 			Message: "no Ready nodes match spec.targetSelector",
 		})
-		fr.Status.Phase = "Progressing"
+		fr.Status.Phase = strProgressing
 		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
 	}
 
@@ -188,30 +194,30 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				}
 			}
 			log.Info("rolling back: deleted bad-image pods", "count", len(stale), "to", desiredImage)
-			fr.Status.Phase = "Progressing"
+			fr.Status.Phase = strProgressing
 			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-				Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "InProgress",
+				Type: strRollingBack, Status: metav1.ConditionTrue, Reason: "InProgress",
 				Message: fmt.Sprintf("rolling back to last-good image %s", desiredImage),
 			})
 			return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueActed})
 		}
 		if updatedCount == n {
-			fr.Status.Phase = "RolledBack"
+			fr.Status.Phase = strRolledBack
 			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-				Type: "RollingBack", Status: metav1.ConditionFalse, Reason: "Completed",
+				Type: strRollingBack, Status: metav1.ConditionFalse, Reason: "Completed",
 				Message: "rolled back to last-good image",
 			})
 			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-				Type: "Ready", Status: metav1.ConditionFalse, Reason: "RolledBack",
+				Type: "Ready", Status: metav1.ConditionFalse, Reason: strRolledBack,
 			})
 			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-				Type: "Degraded", Status: metav1.ConditionTrue, Reason: "RolledBack",
+				Type: "Degraded", Status: metav1.ConditionTrue, Reason: strRolledBack,
 				Message: "rolled back after health-gate failure; edit spec.image to retry",
 			})
 			return r.finish(ctx, &fr, annChanged, ctrl.Result{}) // sticky until spec.image changes
 		}
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "InProgress",
+			Type: strRollingBack, Status: metav1.ConditionTrue, Reason: "InProgress",
 			Message: "waiting for rolled-back pods to become Ready",
 		})
 		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
@@ -260,21 +266,21 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Message: "all target nodes updated and Ready",
 		})
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "Progressing", Status: metav1.ConditionFalse, Reason: "RolloutComplete",
+			Type: strProgressing, Status: metav1.ConditionFalse, Reason: "RolloutComplete",
 		})
 		return r.finish(ctx, &fr, annChanged, ctrl.Result{})
 	}
 
 	// ---- 5. Current wave = first wave with a non-updated node ----
 	curWave := 0
-	for w := 0; w < totalWaves; w++ {
+	for w := range totalWaves {
 		if !waveFullyUpdated(w) {
 			curWave = w
 			break
 		}
 	}
 	fr.Status.CurrentWave = int32(curWave)
-	fr.Status.Phase = "Progressing"
+	fr.Status.Phase = strProgressing
 
 	// ---- 5b. Health gate: promotion from wave (curWave-1) must be approved before we touch curWave ----
 	if curWave > 0 && fr.Spec.HealthGate != nil {
@@ -307,7 +313,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		log.Info("advanced wave: deleted stale pods", "wave", curWave, "count", len(stalePods))
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "Progressing", Status: metav1.ConditionTrue, Reason: "AdvancingWave",
+			Type: strProgressing, Status: metav1.ConditionTrue, Reason: "AdvancingWave",
 			Message: fmt.Sprintf("rolling wave %d (%d pods)", curWave, len(stalePods)),
 		})
 		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueActed})
@@ -346,7 +352,7 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 	if healthy {
 		setAnn(fr, okKey, "1", annChanged)
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "HealthGatePassed", Status: metav1.ConditionTrue, Reason: "Passed",
+			Type: strHealthGate, Status: metav1.ConditionTrue, Reason: "Passed",
 			Message: fmt.Sprintf("wave %d health gate passed", wave),
 		})
 		log.Info("health gate passed", "wave", wave)
@@ -370,7 +376,7 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 			reason, msg = "NoKnownGoodImage", "health gate timed out and no known-good image to roll back to"
 		}
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: reason, Message: msg,
+			Type: strHealthGate, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
 		})
 		log.Info("health gate timed out → paused", "wave", wave)
 		return gateDecision{paused: true}
@@ -381,7 +387,7 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		reason = "PrometheusUnreachable"
 	}
 	apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-		Type: "HealthGatePassed", Status: metav1.ConditionFalse, Reason: reason,
+		Type: strHealthGate, Status: metav1.ConditionFalse, Reason: reason,
 		Message: fmt.Sprintf("wave %d health gate not yet passed", wave),
 	})
 	return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
@@ -402,7 +408,7 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 	if err != nil {
 		return false, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return false, true
 	}
@@ -410,7 +416,7 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 		Status string `json:"status"`
 		Data   struct {
 			Result []struct {
-				Value []interface{} `json:"value"`
+				Value []any `json:"value"`
 			} `json:"result"`
 		} `json:"data"`
 	}
@@ -442,10 +448,10 @@ func (r *FleetRolloutReconciler) onGateHold(ctx context.Context, fr *fleetv1alph
 		setAnn(fr, "rolling-back", "1", &annChanged)
 		setAnn(fr, "rollback-from", fr.Spec.Image, &annChanged)
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-			Type: "RollingBack", Status: metav1.ConditionTrue, Reason: "HealthGateTimeout",
+			Type: strRollingBack, Status: metav1.ConditionTrue, Reason: "HealthGateTimeout",
 			Message: "health gate failed; rolling back to last-good image",
 		})
-		fr.Status.Phase = "Progressing"
+		fr.Status.Phase = strProgressing
 		return r.finish(ctx, fr, annChanged, ctrl.Result{Requeue: true})
 	}
 	return r.finish(ctx, fr, annChanged, d.res)

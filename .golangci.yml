@@ -29,6 +29,9 @@ linters:
       logcheck:
         type: "module"
         description: Checks Go logging calls for Kubernetes logging conventions.
+    gocyclo:
+      # Level-triggered controller Reconcile is inherently branchy (observe → derive → act).
+      min-complexity: 60
     depguard:
       rules:
         forbid-sort-pkg:
