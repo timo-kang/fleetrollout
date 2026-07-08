@@ -103,15 +103,3 @@ func TestDecideGate(t *testing.T) {
 		})
 	}
 }
-
-func TestShortHash(t *testing.T) {
-	a1 := shortHash("registry/img:v1")
-	a2 := shortHash("registry/img:v1")
-	b := shortHash("registry/img:v2")
-	if a1 != a2 {
-		t.Fatalf("shortHash not deterministic: %q vs %q", a1, a2)
-	}
-	if a1 == b {
-		t.Fatalf("shortHash collision for different images: both %q", a1)
-	}
-}

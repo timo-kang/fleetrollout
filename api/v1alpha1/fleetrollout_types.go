@@ -76,11 +76,81 @@ const (
 	RollbackNever     RollbackPolicy = "Never"
 )
 
+// FleetRolloutPhase is a high-level summary of rollout state.
+// +kubebuilder:validation:Enum=Progressing;Paused;RollingBack;RolledBack;Done
+type FleetRolloutPhase string
+
+const (
+	PhaseProgressing FleetRolloutPhase = "Progressing"
+	PhasePaused      FleetRolloutPhase = "Paused"
+	PhaseRollingBack FleetRolloutPhase = "RollingBack"
+	PhaseRolledBack  FleetRolloutPhase = "RolledBack"
+	PhaseDone        FleetRolloutPhase = "Done"
+)
+
+// RolloutPlan is an immutable snapshot of the wave partition for one (image, generation).
+// Wave w is the node slice Nodes[w*WaveSize : min((w+1)*WaveSize, len(Nodes))]. Gate latches
+// (GatedWaves) live inside the plan so replacing the plan atomically clears them — a passed
+// gate can never authorize promotion over a different node set than the one it verified (C2).
+type RolloutPlan struct {
+	// image this plan rolls out; the plan is stale if it differs from the current desired image.
+	// +required
+	Image string `json:"image"`
+
+	// generation of the spec this plan was computed from; a spec change re-plans and resets gates.
+	// +required
+	Generation int64 `json:"generation"`
+
+	// waveSize is the ABSOLUTE per-wave node count, resolved once from spec.waveSize (percent already
+	// applied against len(nodes) at plan time); never re-resolved, so live fleet-size changes cannot
+	// shift wave boundaries.
+	// +kubebuilder:validation:Minimum=1
+	// +required
+	WaveSize int32 `json:"waveSize"`
+
+	// nodes is the frozen, name-sorted list of Ready target node names captured at plan time.
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=5000
+	// +required
+	Nodes []string `json:"nodes"`
+
+	// gatedWaves is the high-water mark: health gates for waves [0, gatedWaves) of THIS plan have
+	// passed. Promotion into wave w requires gatedWaves >= w. Monotonic for the plan's lifetime.
+	// +optional
+	GatedWaves int32 `json:"gatedWaves,omitempty"`
+
+	// evaluatingWave is the wave whose gate is currently being evaluated (timeout anchor).
+	// +optional
+	EvaluatingWave *int32 `json:"evaluatingWave,omitempty"`
+
+	// gateStartedAt is when the gate for evaluatingWave first started evaluating; the timeout base.
+	// Persisted in status so a controller restart resumes (not restarts) the timeout window.
+	// +optional
+	GateStartedAt *metav1.Time `json:"gateStartedAt,omitempty"`
+}
+
+// RollbackStatus records an in-flight (or completed-and-sticky) rollback to the last-good image.
+type RollbackStatus struct {
+	// fromImage is the spec.image that failed its gate; a spec.image different from this value
+	// supersedes and abandons the rollback (roll forward to the new image instead).
+	// +required
+	FromImage string `json:"fromImage"`
+
+	// startedAt is when the rollback was triggered.
+	// +optional
+	StartedAt metav1.Time `json:"startedAt,omitempty"`
+}
+
 // FleetRolloutStatus defines the observed state of FleetRollout.
 type FleetRolloutStatus struct {
-	// phase is a high-level summary: Progressing, Paused, RolledBack, or Done.
+	// phase is a high-level summary of the rollout.
 	// +optional
-	Phase string `json:"phase,omitempty"`
+	Phase FleetRolloutPhase `json:"phase,omitempty"`
+
+	// observedGeneration is the spec generation this status reflects.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// currentWave is the 0-based index of the wave currently being processed.
 	// +optional
@@ -90,9 +160,22 @@ type FleetRolloutStatus struct {
 	// +optional
 	TotalWaves int32 `json:"totalWaves,omitempty"`
 
-	// updatedNodes is the number of nodes successfully updated so far.
+	// updatedNodes is the number of planned nodes running the desired image and Ready.
 	// +optional
 	UpdatedNodes int32 `json:"updatedNodes,omitempty"`
+
+	// lastGoodImage is the most recent image that completed a rollout (reached Done); the
+	// rollback target. Controller-owned in status so GitOps pruning cannot strip it.
+	// +optional
+	LastGoodImage string `json:"lastGoodImage,omitempty"`
+
+	// rollback is non-nil while a rollback is in flight or sticky-completed (phase RolledBack).
+	// +optional
+	Rollback *RollbackStatus `json:"rollback,omitempty"`
+
+	// plan is the immutable wave-assignment snapshot the forward rollout reconciles against.
+	// +optional
+	Plan *RolloutPlan `json:"plan,omitempty"`
 
 	// conditions represent the current state of the FleetRollout resource
 	// (e.g. Progressing, Degraded). Status is one of True, False, or Unknown.

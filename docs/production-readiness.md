@@ -125,15 +125,15 @@ Explicitly **deprioritized** (defensible cut lines): OLM packaging, conversion w
 
 ### v0.2 — "Safe to point at a real fleet" (the safety release)
 
-| Item | Fixes | Size |
-|---|---|---|
-| Gate: distinguish no-data from unhealthy; never auto-rollback on unreachable/5xx (separate hold behavior + condition) | C1/H1 | S |
-| Snapshot wave assignment in status; latch gates against the snapshot, not live indices | C2 | M |
-| Wave-bounded rollback (reverse waves or delete rate-limit) + in-wave `maxUnavailable` | C3/R2 | M |
-| Move all controller state annotations → `status` (lastGoodImage, rollback, gate latches); add `observedGeneration` everywhere; phase enum; `spec.paused` | C6/API2/API3 | M |
-| `minSoakSeconds` on the gate | H4 | S |
-| Events (EventRecorder at every transition) | O2 | S |
-| **CI e2e on kind covering waves/gate/rollback/restart** (+ fake-DS unit tests) | T1/T2 | L — do it first; it protects every other change in this table |
+| Item | Fixes | Size | Status |
+|---|---|---|---|
+| Gate: distinguish no-data from unhealthy; never auto-rollback on unreachable/5xx (separate hold behavior + condition) | C1/H1 | S | ✅ pure `decideGate` (no-data→hold, `MonitoringUnavailable`); 9 unit + kind e2e |
+| Snapshot wave assignment in status; latch gates against the snapshot, not live indices | C2 | M | ✅ `status.plan` freezes node set + absolute `waveSize`; gate latch = `plan.gatedWaves` high-water inside the plan; fake-client regression test (node-join can't shift boundaries) |
+| Wave-bounded rollback (reverse waves or delete rate-limit) + in-wave `maxUnavailable` | C3/R2 | M | ✅ rollback deletes ≤`size`/pass (in-wave `maxUnavailable` still TODO) |
+| Move all controller state annotations → `status` (lastGoodImage, rollback, gate latches); add `observedGeneration` everywhere; phase enum; `spec.paused` | C6/API2/API3 | M | ✅ state fully in `status` (`lastGoodImage`, `rollback`, `plan`); `observedGeneration` on status + every condition; `FleetRolloutPhase` enum; one-time legacy-annotation strip. `spec.paused` deferred |
+| `minSoakSeconds` on the gate | H4 | S | ⬜ |
+| Events (EventRecorder at every transition) | O2 | S | ⬜ |
+| **CI e2e on kind covering waves/gate/rollback/restart** (+ fake-DS unit tests) | T1/T2 | L — do it first; it protects every other change in this table | 🔄 fake-client state-machine unit tests landed; full stub-Prometheus lifecycle e2e next |
 
 ### v0.3 — "Deploys real agents, installable" (the adoption release)
 

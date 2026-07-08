@@ -222,18 +222,102 @@ spec:
                   being processed.
                 format: int32
                 type: integer
-              phase:
-                description: 'phase is a high-level summary: Progressing, Paused,
-                  RolledBack, or Done.'
+              lastGoodImage:
+                description: |-
+                  lastGoodImage is the most recent image that completed a rollout (reached Done); the
+                  rollback target. Controller-owned in status so GitOps pruning cannot strip it.
                 type: string
+              observedGeneration:
+                description: observedGeneration is the spec generation this status
+                  reflects.
+                format: int64
+                type: integer
+              phase:
+                description: phase is a high-level summary of the rollout.
+                enum:
+                - Progressing
+                - Paused
+                - RollingBack
+                - RolledBack
+                - Done
+                type: string
+              plan:
+                description: plan is the immutable wave-assignment snapshot the forward
+                  rollout reconciles against.
+                properties:
+                  evaluatingWave:
+                    description: evaluatingWave is the wave whose gate is currently
+                      being evaluated (timeout anchor).
+                    format: int32
+                    type: integer
+                  gateStartedAt:
+                    description: |-
+                      gateStartedAt is when the gate for evaluatingWave first started evaluating; the timeout base.
+                      Persisted in status so a controller restart resumes (not restarts) the timeout window.
+                    format: date-time
+                    type: string
+                  gatedWaves:
+                    description: |-
+                      gatedWaves is the high-water mark: health gates for waves [0, gatedWaves) of THIS plan have
+                      passed. Promotion into wave w requires gatedWaves >= w. Monotonic for the plan's lifetime.
+                    format: int32
+                    type: integer
+                  generation:
+                    description: generation of the spec this plan was computed from;
+                      a spec change re-plans and resets gates.
+                    format: int64
+                    type: integer
+                  image:
+                    description: image this plan rolls out; the plan is stale if it
+                      differs from the current desired image.
+                    type: string
+                  nodes:
+                    description: nodes is the frozen, name-sorted list of Ready target
+                      node names captured at plan time.
+                    items:
+                      type: string
+                    maxItems: 5000
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  waveSize:
+                    description: |-
+                      waveSize is the ABSOLUTE per-wave node count, resolved once from spec.waveSize (percent already
+                      applied against len(nodes) at plan time); never re-resolved, so live fleet-size changes cannot
+                      shift wave boundaries.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - generation
+                - image
+                - nodes
+                - waveSize
+                type: object
+              rollback:
+                description: rollback is non-nil while a rollback is in flight or
+                  sticky-completed (phase RolledBack).
+                properties:
+                  fromImage:
+                    description: |-
+                      fromImage is the spec.image that failed its gate; a spec.image different from this value
+                      supersedes and abandons the rollback (roll forward to the new image instead).
+                    type: string
+                  startedAt:
+                    description: startedAt is when the rollback was triggered.
+                    format: date-time
+                    type: string
+                required:
+                - fromImage
+                type: object
               totalWaves:
                 description: totalWaves is the total number of waves planned for this
                   rollout.
                 format: int32
                 type: integer
               updatedNodes:
-                description: updatedNodes is the number of nodes successfully updated
-                  so far.
+                description: updatedNodes is the number of planned nodes running the
+                  desired image and Ready.
                 format: int32
                 type: integer
             type: object
