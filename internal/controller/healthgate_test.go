@@ -76,6 +76,34 @@ func TestEvalPromQL_Unreachable(t *testing.T) {
 	}
 }
 
+func TestDecideGate(t *testing.T) {
+	// reachable, healthy, timedOut, onFailure, hasLastGood → want
+	cases := []struct {
+		name                                        string
+		reachable, healthy, timedOut, onFail, hasLG bool
+		want                                        gateAction
+	}{
+		{"healthy promotes", true, true, false, true, true, gatePass},
+		{"healthy promotes even past timeout", true, true, true, true, true, gatePass},
+		{"reachable unhealthy, not timed out → wait", true, false, false, true, true, gateWait},
+		{"reachable unhealthy, timed out, OnFailure+lastGood → rollback", true, false, true, true, true, gateRollback},
+		{"reachable unhealthy, timed out, Never → pause", true, false, true, false, true, gatePauseTimeout},
+		{"reachable unhealthy, timed out, OnFailure no lastGood → pause", true, false, true, true, false, gatePauseTimeout},
+		// The safety-critical rows: unreachable must NEVER rollback/pause, regardless of timeout/policy.
+		{"unreachable, not timed out → wait", false, false, false, true, true, gateWait},
+		{"unreachable, timed out, OnFailure+lastGood → still wait (no rollback on no-data)", false, false, true, true, true, gateWait},
+		{"unreachable, timed out, Never → still wait", false, false, true, false, true, gateWait},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := decideGate(c.reachable, c.healthy, c.timedOut, c.onFail, c.hasLG); got != c.want {
+				t.Fatalf("decideGate(reachable=%v,healthy=%v,timedOut=%v,onFail=%v,hasLG=%v) = %v, want %v",
+					c.reachable, c.healthy, c.timedOut, c.onFail, c.hasLG, got, c.want)
+			}
+		})
+	}
+}
+
 func TestShortHash(t *testing.T) {
 	a1 := shortHash("registry/img:v1")
 	a2 := shortHash("registry/img:v1")

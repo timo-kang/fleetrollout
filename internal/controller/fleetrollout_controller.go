@@ -177,27 +177,43 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	fr.Status.UpdatedNodes = int32(updatedCount)
 
-	// ---- Rollback path: revert to last-good image, all at once (no waves, no gate) ----
+	// waveSize resolution (count/percent, ceil, clamp >=1) — used by rollback and forward paths.
+	ws := fr.Spec.WaveSize
+	if ws.StrVal == "" && ws.IntVal == 0 {
+		ws = intstr.FromString("20%")
+	}
+	size, err := intstr.GetScaledValueFromIntOrPercent(&ws, n, true)
+	if err != nil || size < 1 {
+		size = 1
+	}
+	if size > n {
+		size = n
+	}
+	totalWaves := (n + size - 1) / size
+	fr.Status.TotalWaves = int32(totalWaves)
+
+	// ---- Rollback path: revert to last-good, wave-bounded (≤ size deletions per pass) ----
 	if rollingBack {
-		var stale []*corev1.Pod
+		deleted := 0
 		for _, node := range nodeNames {
+			if deleted >= size {
+				break
+			}
 			p := podByNode[node]
 			if p != nil && p.DeletionTimestamp.IsZero() && len(p.Spec.Containers) > 0 &&
 				p.Spec.Containers[0].Image != desiredImage {
-				stale = append(stale, p)
-			}
-		}
-		if len(stale) > 0 {
-			for _, p := range stale {
 				if err := r.Delete(ctx, p); err != nil && client.IgnoreNotFound(err) != nil {
 					return ctrl.Result{}, err
 				}
+				deleted++
 			}
-			log.Info("rolling back: deleted bad-image pods", "count", len(stale), "to", desiredImage)
+		}
+		if deleted > 0 {
+			log.Info("rolling back: deleted bad-image pods", "count", deleted, "to", desiredImage)
 			fr.Status.Phase = strProgressing
 			apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 				Type: strRollingBack, Status: metav1.ConditionTrue, Reason: "InProgress",
-				Message: fmt.Sprintf("rolling back to last-good image %s", desiredImage),
+				Message: fmt.Sprintf("rolling back to last-good image %s (≤%d/wave)", desiredImage, size),
 			})
 			return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueActed})
 		}
@@ -222,21 +238,6 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		})
 		return r.finish(ctx, &fr, annChanged, ctrl.Result{RequeueAfter: requeueConverging})
 	}
-
-	// waveSize resolution (count/percent, ceil, clamp >= 1)
-	ws := fr.Spec.WaveSize
-	if ws.StrVal == "" && ws.IntVal == 0 {
-		ws = intstr.FromString("20%")
-	}
-	size, err := intstr.GetScaledValueFromIntOrPercent(&ws, n, true)
-	if err != nil || size < 1 {
-		size = 1
-	}
-	if size > n {
-		size = n
-	}
-	totalWaves := (n + size - 1) / size
-	fr.Status.TotalWaves = int32(totalWaves)
 
 	waveFullyUpdated := func(w int) bool {
 		start, end := w*size, min((w+1)*size, n)
@@ -349,7 +350,17 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 	}
 
 	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, gate.Query)
-	if healthy {
+	start, _ := time.Parse(time.RFC3339, startStr)
+	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
+	if timeout == 0 {
+		timeout = 300 * time.Second
+	}
+	lg := fr.Annotations[annPrefix+"last-good-image"]
+	onFailure := fr.Spec.RollbackPolicy == fleetv1alpha1.RollbackOnFailure
+	hasLastGood := lg != "" && lg != fr.Spec.Image
+
+	switch decideGate(reachable, healthy, time.Since(start) >= timeout, onFailure, hasLastGood) {
+	case gatePass:
 		setAnn(fr, okKey, "1", annChanged)
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: strHealthGate, Status: metav1.ConditionTrue, Reason: "Passed",
@@ -357,40 +368,60 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		})
 		log.Info("health gate passed", "wave", wave)
 		return gateDecision{promote: true, res: ctrl.Result{Requeue: true}}
-	}
-
-	start, _ := time.Parse(time.RFC3339, startStr)
-	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
-	if timeout == 0 {
-		timeout = 300 * time.Second
-	}
-	if time.Since(start) >= timeout {
-		lg := fr.Annotations[annPrefix+"last-good-image"]
-		if fr.Spec.RollbackPolicy == fleetv1alpha1.RollbackOnFailure && lg != "" && lg != fr.Spec.Image {
-			log.Info("health gate timed out → rolling back", "wave", wave, "lastGood", lg)
-			return gateDecision{rollback: true}
+	case gateRollback:
+		log.Info("health gate unhealthy past timeout → rolling back", "wave", wave, "lastGood", lg)
+		return gateDecision{rollback: true}
+	case gatePauseTimeout:
+		reason, msg := "Timeout", fmt.Sprintf("wave %d gate unhealthy past %s", wave, timeout)
+		if onFailure && !hasLastGood {
+			reason, msg = "NoKnownGoodImage", "gate unhealthy past timeout and no known-good image to roll back to"
 		}
 		fr.Status.Phase = "Paused"
-		reason, msg := "Timeout", fmt.Sprintf("wave %d health gate timed out after %s", wave, timeout)
-		if fr.Spec.RollbackPolicy == fleetv1alpha1.RollbackOnFailure && lg == "" {
-			reason, msg = "NoKnownGoodImage", "health gate timed out and no known-good image to roll back to"
+		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
+			Type: strHealthGate, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
+		})
+		log.Info("health gate unhealthy past timeout → paused", "wave", wave)
+		return gateDecision{paused: true}
+	default: // gateWait — includes unreachable, which NEVER escalates (no data ≠ unhealthy)
+		reason, msg := "Evaluating", fmt.Sprintf("wave %d health gate not yet passed", wave)
+		if !reachable {
+			reason, msg = "MonitoringUnavailable", "Prometheus unreachable — holding, never rolling back on missing data"
 		}
 		apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
 			Type: strHealthGate, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
 		})
-		log.Info("health gate timed out → paused", "wave", wave)
-		return gateDecision{paused: true}
+		return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
 	}
+}
 
-	reason := "Evaluating"
-	if !reachable {
-		reason = "PrometheusUnreachable"
+// gateAction is the pure outcome of a health-gate observation.
+type gateAction int
+
+const (
+	gatePass gateAction = iota
+	gateWait
+	gateRollback
+	gatePauseTimeout
+)
+
+// decideGate is the pure, unit-tested safety decision for a health gate.
+// Key invariant: missing data (Prometheus unreachable) NEVER escalates to rollback or pause —
+// only a reachable, definitively-unhealthy signal that persists past the timeout does.
+// This prevents a monitoring outage from triggering a fleet-wide rollback.
+func decideGate(reachable, healthy, timedOut, onFailure, hasLastGood bool) gateAction {
+	if healthy {
+		return gatePass
 	}
-	apimeta.SetStatusCondition(&fr.Status.Conditions, metav1.Condition{
-		Type: strHealthGate, Status: metav1.ConditionFalse, Reason: reason,
-		Message: fmt.Sprintf("wave %d health gate not yet passed", wave),
-	})
-	return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
+	if !reachable {
+		return gateWait // no data ≠ unhealthy: hold and retry, do not escalate
+	}
+	if !timedOut {
+		return gateWait
+	}
+	if onFailure && hasLastGood {
+		return gateRollback
+	}
+	return gatePauseTimeout
 }
 
 // evalPromQL runs an instant query; healthy = >=1 sample and every sample value > 0.
