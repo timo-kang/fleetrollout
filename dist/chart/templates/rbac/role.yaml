@@ -1,0 +1,65 @@
+{{- if .Values.rbac.enable }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+  name: fleetrollout-manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - fleet.fleetrollout.io
+  resources:
+  - fleetrollouts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - fleet.fleetrollout.io
+  resources:
+  - fleetrollouts/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - fleet.fleetrollout.io
+  resources:
+  - fleetrollouts/status
+  verbs:
+  - get
+  - patch
+  - update
+{{- end -}}

@@ -43,30 +43,71 @@ NAME           PHASE         WAVE   UPDATED   AGE
 camera-agent   Progressing   2      18        4m
 ```
 
-## Architecture (early)
+## How it works
 
-A `controller-runtime` reconcile loop that:
-1. resolves target nodes from `targetSelector` and partitions them into waves,
-2. rolls out `image` to the current wave and waits for readiness,
-3. evaluates the optional `healthGate` (PromQL) before promoting,
-4. advances or rolls back, updating `status` (`phase`, `currentWave`, `updatedNodes`).
+The controller owns a single DaemonSet with `updateStrategy: OnDelete`, so updating its
+template restarts nothing. It advances a wave by **deleting that wave's stale pods**; the
+DaemonSet recreates them on the new image. Progress is *derived every reconcile* from pod
+image + readiness (level-based, restart-safe) — never remembered. See
+[docs/reconcile-design.md](docs/reconcile-design.md) for the full design and trade-offs.
+
+```mermaid
+flowchart TD
+    A[Reconcile] --> B[Ensure owned DaemonSet<br/>image=spec.image, OnDelete]
+    B --> C[Resolve Ready target nodes<br/>sort + partition into waves]
+    C --> D{All nodes on<br/>desired image + Ready?}
+    D -- yes --> G{healthGate?}
+    G -- pass/none --> DONE[phase: Done]
+    D -- no --> E[current wave =<br/>first incomplete wave]
+    E --> H{prev wave gate<br/>passed?}
+    H -- no, evaluating --> W[requeue]
+    H -- no, timeout + OnFailure --> RB[roll back to last-good<br/>phase: RolledBack]
+    H -- no, timeout + Never --> P[phase: Paused]
+    H -- yes / wave 0 --> F[delete stale pods in wave<br/>DaemonSet recreates on new image]
+    F --> W
+```
 
 ## Roadmap
 
 - [x] `FleetRollout` CRD + scaffold
-- [ ] MVP reconcile: wave partitioning + readiness-based promotion
-- [ ] PromQL health gate + automatic rollback
-- [ ] Offline-node re-join convergence
-- [ ] kind-based e2e + Helm chart
+- [x] MVP reconcile: wave partitioning + readiness-based promotion (level-based, `OnDelete`)
+- [x] PromQL health gate (gated wave promotion) + automatic rollback (`OnFailure` → last-good)
+- [x] Node watch, unit tests, kind e2e, Helm chart
+- [ ] Offline-node re-join convergence; envtest; richer gates (thresholds, multi-query)
 
-## Local development
+## Try it locally (kind)
 
 ```sh
-make install        # install CRDs into the current cluster (kind)
-make run            # run the controller locally
+kind create cluster --config hack/kind.yaml           # control-plane + 4 workers
+kubectl label nodes -l '!node-role.kubernetes.io/control-plane' fleet-group=field-robots
+make install && make run                               # CRDs + run controller locally
+kubectl apply -f config/samples/                       # a sample FleetRollout
+kubectl get fleetrollout -w
 ```
 
-Requires Go 1.24+, `kubebuilder`, and `kind` (or any Kubernetes cluster).
+Install via Helm (generated chart):
+
+```sh
+helm install fleetrollout ./dist/chart
+```
+
+Requires Go 1.24+, `kubebuilder`, `kind`, and `helm`.
+
+## Demo (real output)
+
+Upgrading a 4-node fleet with `waveSize: "25%"` and a health gate — rolls one wave at a time,
+and on a failing gate rolls back to the last-good image:
+
+```
+# healthy gate: promotes wave-by-wave to Done (4 gate passes)
+$ kubectl get fleetrollout rb-demo
+NAME      PHASE   WAVE   UPDATED
+rb-demo   Done    4      4
+
+# failing gate + rollbackPolicy: OnFailure → reverts to last-good, phase RolledBack
+$ kubectl get fleetrollout rb-demo -o jsonpath='{.status.phase}'
+RolledBack
+```
 
 ## License
 
