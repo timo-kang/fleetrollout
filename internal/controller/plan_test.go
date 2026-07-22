@@ -435,3 +435,34 @@ func TestNodeJoinStaysGated(t *testing.T) {
 		t.Error("a node not in the plan must stay gated (its pod must not be released ungated)")
 	}
 }
+
+// TestSteadyStateAdoptionAtDone: once the rollout is Done, a node that joins afterward is adopted —
+// its gated pod is ungated (the current template has fully passed the gate, so it is safe to run).
+func TestSteadyStateAdoptionAtDone(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("50%")
+	hash := frTemplateHash(fr)
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2"),
+			ownedPod("n1", hash), ownedPod("n2", hash)). // both planned nodes already updated
+		Build()
+
+	got := reconcileOnce(t, c) // plan frozen over {n1,n2}; all updated → Done
+	if got.Status.Phase != fleetv1alpha1.PhaseDone {
+		t.Fatalf("phase = %q, want Done", got.Status.Phase)
+	}
+
+	// A node joins after completion, with a born-gated pod on the current template.
+	if err := c.Create(context.Background(), readyNode("n9")); err != nil {
+		t.Fatalf("create n9: %v", err)
+	}
+	if err := c.Create(context.Background(), gatedPod("n9", hash)); err != nil {
+		t.Fatalf("create gated pod on n9: %v", err)
+	}
+	reconcileOnce(t, c)
+
+	if podIsGated(t, c, "n9") {
+		t.Error("a node joining after Done should be adopted (its current-template pod ungated)")
+	}
+}

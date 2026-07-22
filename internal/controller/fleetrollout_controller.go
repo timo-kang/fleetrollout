@@ -274,6 +274,24 @@ func (r *FleetRolloutReconciler) reconcileForward(ctx context.Context, log logr,
 				return r.onGateHold(ctx, fr, d)
 			}
 		}
+
+		// Steady-state adoption: the rollout is complete and the current template has fully passed
+		// the gate, so a node that joined after the plan was frozen is safe to release. Ungate any
+		// gated-on-current pod on a Ready target node (planned nodes are never gated here — a gated
+		// pod is unscheduled, so it would have kept pendingCount > 0 and we would not be at Done).
+		adopted := 0
+		for node, p := range podByNode {
+			if eligible(node) && podGatedOn(p, currentHash) {
+				if err := r.ungate(ctx, p); err != nil {
+					return ctrl.Result{}, err
+				}
+				adopted++
+			}
+		}
+		if adopted > 0 {
+			log.Info("adopted nodes that joined after rollout completion", "count", adopted)
+		}
+
 		fr.Status.Phase = fleetv1alpha1.PhaseDone
 		fr.Status.CurrentWave = int32(total)
 		fr.Status.LastGood = &fleetv1alpha1.LastGood{

@@ -44,7 +44,7 @@ With `OnDelete`, updating the DS template does **not** restart any pod. A pod on
 
 **Cons / accepted costs:**
 
-* ~~First deployment: the DS schedules the image to **all** target nodes at once, bypassing waves.~~ **Closed in v0.3 (C4).** The DS template carries a `fleetrollout.fleet.fleetrollout.io/wave` pod `schedulingGate`, so every DS-created pod is born SchedulingGated (unscheduled, zero node footprint); the controller removes the gate per wave, after the prior wave's health gate passes. Scheduling is therefore wave- and gate-bounded from the very first deploy, and a node that joins mid-rollout stays gated (running nothing) until it is included in a fresh plan — no more "new node gets the ungated new image immediately" bypass.
+* ~~First deployment: the DS schedules the image to **all** target nodes at once, bypassing waves.~~ **Closed in v0.3 (C4).** The DS template carries a `fleetrollout.fleet.fleetrollout.io/wave` pod `schedulingGate`, so every DS-created pod is born SchedulingGated (unscheduled, zero node footprint); the controller removes the gate per wave, after the prior wave's health gate passes. Scheduling is therefore wave- and gate-bounded from the very first deploy, and a node that joins *mid-rollout* stays gated (running nothing) rather than getting the ungated new image immediately. Once the rollout is **Done** (the current template has fully passed the gate), a node that joins afterward is *adopted* — its gated pod is ungated, since the template is by then trusted fleet-wide.
 * Update granularity is pod-level, so we identify "wave membership" by pod→node mapping at delete time.
 
 ### Option C — Controller creates bare per-node Pods (or per-wave Jobs) itself
