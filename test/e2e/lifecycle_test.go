@@ -109,7 +109,7 @@ var _ = Describe("Rollout lifecycle (waves / gate / rollback)", Ordered, func() 
 		By("upgrading to a new image — every inter-wave gate passes, so it reaches Done")
 		upgradeImage(name, imgB)
 		waitPhase(name, "Done", 3*time.Minute)
-		Expect(frField(name, "{.status.lastGoodImage}")).To(Equal(imgB))
+		Expect(frField(name, "{.status.lastGood.image}")).To(Equal(imgB))
 		Expect(frField(name, "{.status.observedGeneration}")).To(Equal("2"))
 	})
 
@@ -153,6 +153,62 @@ var _ = Describe("Rollout lifecycle (waves / gate / rollback)", Ordered, func() 
 		By("upgrading behind an unhealthy gate with rollbackPolicy=Never")
 		upgradeWithGate(name, imgB, promUnhealthy, 15)
 		waitPhase(name, "Paused", 4*time.Minute)
+	})
+
+	It("S5: fresh deploy is wave-bounded — future waves stay SchedulingGated (C4)", func() {
+		const name = "s5-gated"
+		// waveSize 1 over 3 workers; an UNREACHABLE gate holds promotion after wave 0, so only
+		// wave 0 is ever ungated. This proves scheduling is wave+gate-bounded from the FIRST deploy
+		// (no mass scheduling) — the documented first-deploy bypass is closed.
+		applyRollout(name, imgA, "OnFailure", promUnreachable, 30)
+
+		By("exactly one node (wave 0) schedules; the other two stay SchedulingGated")
+		Eventually(func(g Gomega) {
+			g.Expect(scheduledPodCount(name)).To(Equal(1), "only wave 0 should schedule")
+			g.Expect(schedulingGatedPodCount(name)).To(Equal(2), "future-wave pods must stay gated")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("and the fleet is never released at once, even past the gate timeout")
+		Consistently(func(g Gomega) {
+			g.Expect(scheduledPodCount(name)).To(Equal(1))
+		}, 45*time.Second, 5*time.Second).Should(Succeed())
+	})
+
+	It("S6: deploys a full spec.template (real agent) to Done (C5)", func() {
+		const name = "s6-template"
+		// A full pod template with env + a resource request — none of which spec.image could express.
+		kubectlApply(fmt.Sprintf(`apiVersion: fleet.fleetrollout.io/v1alpha1
+kind: FleetRollout
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  targetSelector:
+    matchLabels:
+      fleet-group: field-robots
+  waveSize: 100%%
+  template:
+    spec:
+      containers:
+        - name: agent
+          image: %s
+          env:
+            - name: LOG_LEVEL
+              value: debug
+          resources:
+            requests:
+              cpu: 10m
+`, name, crNS, imgA))
+
+		waitPhase(name, "Done", 3*time.Minute)
+
+		By("the rolled pods carry the template's env var (proving full-template rendering)")
+		Eventually(func(g Gomega) {
+			out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", crNS, "-l", ownerSelector+name,
+				"-o", "jsonpath={.items[0].spec.containers[0].env[?(@.name==\"LOG_LEVEL\")].value}"))
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(out)).To(Equal("debug"))
+		}, time.Minute, 5*time.Second).Should(Succeed())
 	})
 })
 
@@ -224,6 +280,29 @@ func waitPhase(name, phase string, timeout time.Duration) {
 	Eventually(func(g Gomega) {
 		g.Expect(frField(name, "{.status.phase}")).To(Equal(phase))
 	}, timeout, 5*time.Second).Should(Succeed(), "%s never reached phase %s", name, phase)
+}
+
+// scheduledPodCount counts the rollout's pods that have been bound to a node (spec.nodeName set).
+func scheduledPodCount(name string) int {
+	out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", crNS, "-l", ownerSelector+name,
+		"-o", "jsonpath={range .items[*]}{.spec.nodeName}{\"\\n\"}{end}"))
+	Expect(err).NotTo(HaveOccurred())
+	return len(utils.GetNonEmptyLines(out))
+}
+
+// schedulingGatedPodCount counts the rollout's pods held unscheduled by the wave scheduling gate
+// (PodScheduled condition reason == SchedulingGated).
+func schedulingGatedPodCount(name string) int {
+	out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", crNS, "-l", ownerSelector+name,
+		"-o", "jsonpath={range .items[*]}{.status.conditions[?(@.type=='PodScheduled')].reason}{\"\\n\"}{end}"))
+	Expect(err).NotTo(HaveOccurred())
+	n := 0
+	for _, line := range utils.GetNonEmptyLines(out) {
+		if strings.TrimSpace(line) == "SchedulingGated" {
+			n++
+		}
+	}
+	return n
 }
 
 // podImages returns the sorted, de-duplicated set of container images across the rollout's pods.

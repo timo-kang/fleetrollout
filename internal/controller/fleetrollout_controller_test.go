@@ -46,7 +46,7 @@ var _ = Describe("FleetRollout Controller", func() {
 			By("creating two Ready nodes labeled for the fleet")
 			for _, n := range nodeNames {
 				node := &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: n, Labels: map[string]string{"fleet-group": "field-robots"}},
+					ObjectMeta: metav1.ObjectMeta{Name: n, Labels: map[string]string{fleetGroupKey: fleetGroupVal}},
 				}
 				Expect(k8sClient.Create(ctx, node)).To(Succeed())
 				node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
@@ -57,7 +57,7 @@ var _ = Describe("FleetRollout Controller", func() {
 			fr := &fleetv1alpha1.FleetRollout{
 				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
 				Spec: fleetv1alpha1.FleetRolloutSpec{
-					TargetSelector: metav1.LabelSelector{MatchLabels: map[string]string{"fleet-group": "field-robots"}},
+					TargetSelector: metav1.LabelSelector{MatchLabels: map[string]string{fleetGroupKey: fleetGroupVal}},
 					Image:          image,
 					WaveSize:       intstr.FromString("50%"),
 				},

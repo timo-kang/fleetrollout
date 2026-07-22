@@ -37,6 +37,7 @@ const (
 	frName        = "fr"
 	nsDefault     = "default"
 	frImage       = "img:v1"
+	imgV2         = "img:v2"
 	lastGoodImg   = "img:v0"
 	fleetGroupKey = "fleet-group"
 	fleetGroupVal = "field-robots"
@@ -107,7 +108,7 @@ func TestPlanSnapshotCreatedOnFirstReconcile(t *testing.T) {
 	if got.Status.Plan == nil {
 		t.Fatal("expected status.plan to be set after first reconcile")
 	}
-	if got.Status.Plan.Image != "img:v1" {
+	if got.Status.Plan.Image != frImage {
 		t.Errorf("plan.image = %q, want img:v1", got.Status.Plan.Image)
 	}
 	if got.Status.Plan.WaveSize != 1 {
@@ -179,14 +180,14 @@ func TestPlanReplacedOnImageChange(t *testing.T) {
 	}
 
 	// User rolls a new image (generation bumps).
-	got.Spec.Image = "img:v2"
+	got.Spec.Image = imgV2
 	got.Generation = 2
 	if err := c.Update(context.Background(), got); err != nil {
 		t.Fatalf("update image: %v", err)
 	}
 	got = reconcileOnce(t, c)
 
-	if got.Status.Plan.Image != "img:v2" {
+	if got.Status.Plan.Image != imgV2 {
 		t.Errorf("plan.image = %q, want img:v2 (plan must be replaced)", got.Status.Plan.Image)
 	}
 	if got.Status.Plan.GatedWaves != 0 {
@@ -224,16 +225,16 @@ func TestOldAnnotationsStrippedOnReconcile(t *testing.T) {
 	}
 }
 
-// ownedPod builds a DS-owned pod on a node running the given image, Ready.
-func ownedPod(node, image string) *corev1.Pod {
+// ownedPod builds a DS-owned pod on a node carrying the given template hash, scheduled and Ready.
+func ownedPod(node, hash string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod-" + node, Namespace: nsDefault,
-			Labels: map[string]string{ownerLabel: frName},
+			Labels: map[string]string{ownerLabel: frName, hashLabel: hash},
 		},
 		Spec: corev1.PodSpec{
 			NodeName:   node,
-			Containers: []corev1.Container{{Name: agentContainer, Image: image}},
+			Containers: []corev1.Container{{Name: agentContainer, Image: "img"}},
 		},
 		Status: corev1.PodStatus{
 			Phase:      corev1.PodRunning,
@@ -242,14 +243,19 @@ func ownedPod(node, image string) *corev1.Pod {
 	}
 }
 
-// TestRollbackSupersededByNewImage: a spec.image different from rollback.fromImage abandons the
-// in-flight rollback and rolls forward (plan is rebuilt for the new image).
+// frTemplateHash returns the hash the controller computes for a spec.image FleetRollout.
+func frTemplateHash(fr *fleetv1alpha1.FleetRollout) string {
+	return computeTemplateHash(renderBaseTemplate(fr))
+}
+
+// TestRollbackSupersededByNewImage: a desired template hash different from rollback.fromHash
+// abandons the in-flight rollback and rolls forward (plan is rebuilt for the new template).
 func TestRollbackSupersededByNewImage(t *testing.T) {
 	s := planTestScheme(t)
 	fr := newFleetRollout("50%") // spec.image = frImage ("img:v1")
 	fr.Status = fleetv1alpha1.FleetRolloutStatus{
-		LastGoodImage: lastGoodImg,
-		Rollback:      &fleetv1alpha1.RollbackStatus{FromImage: "img:vFAILED"}, // != spec.image
+		LastGood: &fleetv1alpha1.LastGood{TemplateHash: "goodhash", Image: lastGoodImg},
+		Rollback: &fleetv1alpha1.RollbackStatus{FromHash: "some-other-failed-hash"}, // != current hash
 	}
 	c := fake.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
@@ -259,24 +265,25 @@ func TestRollbackSupersededByNewImage(t *testing.T) {
 	got := reconcileOnce(t, c)
 
 	if got.Status.Rollback != nil {
-		t.Errorf("rollback should be superseded (cleared) when spec.image != fromImage, got %+v", got.Status.Rollback)
+		t.Errorf("rollback should be superseded (cleared) when desired hash != fromHash, got %+v", got.Status.Rollback)
 	}
 	if got.Status.Plan == nil || got.Status.Plan.Image != frImage {
 		t.Errorf("expected a forward plan for the new spec.image %q, got %+v", frImage, got.Status.Plan)
 	}
 }
 
-// TestRollbackDeletesStalePod: while rolling back, a pod still running the failed image is deleted
-// so the DS recreates it on the last-good image; the plan is never consulted.
+// TestRollbackDeletesStalePod: while rolling back, a pod still on the failed template hash is
+// deleted so the DS recreates it on the last-good template; the plan is never consulted.
 func TestRollbackDeletesStalePod(t *testing.T) {
 	s := planTestScheme(t)
-	fr := newFleetRollout("50%") // spec.image = "img:v1" (the failed image)
+	fr := newFleetRollout("50%") // spec.image = frImage ("img:v1") — the failed template
+	failedHash := frTemplateHash(fr)
 	fr.Status = fleetv1alpha1.FleetRolloutStatus{
-		LastGoodImage: lastGoodImg,
-		Rollback:      &fleetv1alpha1.RollbackStatus{FromImage: frImage}, // == spec.image → active rollback
+		LastGood: &fleetv1alpha1.LastGood{TemplateHash: "goodhash", Image: lastGoodImg},
+		Rollback: &fleetv1alpha1.RollbackStatus{FromHash: failedHash}, // == current hash → active rollback
 	}
-	stale := ownedPod("n1", frImage)    // running the failed image, must be deleted
-	good := ownedPod("n2", lastGoodImg) // already on last-good, must be left alone
+	stale := ownedPod("n1", failedHash) // on the failed hash, must be deleted
+	good := ownedPod("n2", "goodhash")  // already on last-good, must be left alone
 	c := fake.NewClientBuilder().WithScheme(s).
 		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
 		WithObjects(fr, readyNode("n1"), readyNode("n2"), stale, good).
@@ -292,5 +299,139 @@ func TestRollbackDeletesStalePod(t *testing.T) {
 	}
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "pod-n2", Namespace: nsDefault}, &corev1.Pod{}); err != nil {
 		t.Errorf("last-good pod-n2 must be left alone during rollback, got %v", err)
+	}
+}
+
+// gatedPod builds a DS-owned pod born SchedulingGated on the given hash: no NodeName yet, target
+// node carried in the DS-style node-affinity term (metadata.name), Pending.
+func gatedPod(node, hash string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-" + node, Namespace: nsDefault,
+			Labels: map[string]string{ownerLabel: frName, hashLabel: hash},
+		},
+		Spec: corev1.PodSpec{
+			Containers:      []corev1.Container{{Name: agentContainer, Image: "img"}},
+			SchedulingGates: []corev1.PodSchedulingGate{{Name: waveGateName}},
+			Affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchFields: []corev1.NodeSelectorRequirement{{
+							Key: objectNameField, Operator: corev1.NodeSelectorOpIn, Values: []string{node},
+						}},
+					}},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+}
+
+func podIsGated(t *testing.T, c client.Client, node string) bool {
+	t.Helper()
+	p := &corev1.Pod{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "pod-" + node, Namespace: nsDefault}, p); err != nil {
+		t.Fatalf("get pod-%s: %v", node, err)
+	}
+	return podGated(p)
+}
+
+// TestGatedPodNotUpdated_UngatedWaveByWave is the C4 core: on a fresh deploy every pod is born
+// SchedulingGated; the controller ungates only the current wave, wave-by-wave — it never releases
+// the whole fleet at once. A gated pod never counts as updated.
+func TestGatedPodNotUpdated_UngatedWaveByWave(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("25%") // 4 nodes → 1 node/wave → 4 waves
+	nodes := []string{"n1", "n2", "n3", "n4"}
+	hash := frTemplateHash(fr)
+	objs := make([]client.Object, 0, 1+2*len(nodes))
+	objs = append(objs, fr)
+	for _, n := range nodes {
+		objs = append(objs, readyNode(n), gatedPod(n, hash)) // DS created every pod, all gated
+	}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(objs...).Build()
+
+	reconcileOnce(t, c)
+
+	gatedByNode := map[string]bool{}
+	for _, n := range nodes {
+		gatedByNode[n] = podIsGated(t, c, n)
+	}
+	if gatedByNode["n1"] {
+		t.Error("wave-0 node n1 should have been ungated")
+	}
+	for _, n := range []string{"n2", "n3", "n4"} {
+		if !gatedByNode[n] {
+			t.Errorf("node %s (future wave) must stay gated — the fleet must not be released at once", n)
+		}
+	}
+}
+
+// TestTemplateFieldChangeTriggersRollout (C5): changing a non-image template field (env) changes
+// the hash, which invalidates the plan and re-rolls — the artifact is the whole template.
+func TestTemplateFieldChangeTriggersRollout(t *testing.T) {
+	s := planTestScheme(t)
+	tmpl := func(logLevel string) *corev1.PodTemplateSpec {
+		return &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: agentContainer, Image: "img:v1",
+			Env: []corev1.EnvVar{{Name: "LOG_LEVEL", Value: logLevel}},
+		}}}}
+	}
+	fr := &fleetv1alpha1.FleetRollout{
+		ObjectMeta: metav1.ObjectMeta{Name: frName, Namespace: nsDefault, Generation: 1},
+		Spec: fleetv1alpha1.FleetRolloutSpec{
+			TargetSelector: metav1.LabelSelector{MatchLabels: map[string]string{fleetGroupKey: fleetGroupVal}},
+			Template:       tmpl("info"),
+			WaveSize:       intstr.FromString("50%"),
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2")).Build()
+
+	got := reconcileOnce(t, c)
+	firstHash := got.Status.Plan.TemplateHash
+
+	// Change only an env var (image unchanged), bump generation as the API server would.
+	got.Spec.Template = tmpl("debug")
+	got.Generation = 2
+	if err := c.Update(context.Background(), got); err != nil {
+		t.Fatalf("update template: %v", err)
+	}
+	got = reconcileOnce(t, c)
+
+	if got.Status.Plan.TemplateHash == firstHash {
+		t.Error("an env-only template change must change the plan template hash (re-roll)")
+	}
+	if got.Status.Plan.Generation != 2 {
+		t.Errorf("plan.generation = %d, want 2", got.Status.Plan.Generation)
+	}
+}
+
+// TestNodeJoinStaysGated (C4): a node that joins mid-rollout is not in the plan snapshot, so its
+// born-gated pod is never ungated — it safely runs nothing rather than bypassing the gate.
+func TestNodeJoinStaysGated(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("50%")
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2")).Build()
+
+	got := reconcileOnce(t, c) // freezes plan over n1,n2
+	hash := got.Status.Plan.TemplateHash
+
+	// A new node joins with a born-gated pod (as the DS would create).
+	if err := c.Create(context.Background(), readyNode("n9")); err != nil {
+		t.Fatalf("create n9: %v", err)
+	}
+	if err := c.Create(context.Background(), gatedPod("n9", hash)); err != nil {
+		t.Fatalf("create gated pod on n9: %v", err)
+	}
+	reconcileOnce(t, c)
+
+	if !podIsGated(t, c, "n9") {
+		t.Error("a node not in the plan must stay gated (its pod must not be released ungated)")
 	}
 }

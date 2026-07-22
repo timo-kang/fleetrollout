@@ -13,8 +13,10 @@ FleetRollout is a small controller that fills that gap.
 ## What it does
 
 - **Wave-by-wave rollout** — update the fleet in controlled increments (`waveSize` as a count or percentage) instead of all at once.
+- **Scheduling-gated waves** — pods are born with a pod `schedulingGate`; the controller ungates them per wave, so even the *first* deploy and nodes that join mid-rollout can't skip the waves or the health gate.
 - **Health-gated promotion** — advance to the next wave only when an optional PromQL health check passes.
 - **Automatic rollback** — on wave failure, roll back per `rollbackPolicy`.
+- **Real workloads** — roll a full `spec.template` (`PodTemplateSpec`: env, volumes, resources, securityContext, sidecars, …), or use `spec.image` as shorthand for a single-container agent. Any template field change triggers a rollout.
 - **Node targeting** — select the fleet by label (`targetSelector`).
 
 ## Example
@@ -46,10 +48,11 @@ camera-agent   Progressing   2      18        4m
 ## How it works
 
 The controller owns a single DaemonSet with `updateStrategy: OnDelete`, so updating its
-template restarts nothing. It advances a wave by **deleting that wave's stale pods**; the
-DaemonSet recreates them on the new image. Progress is *derived every reconcile* from pod
-image + readiness (level-based, restart-safe) — never remembered. See
-[docs/reconcile-design.md](docs/reconcile-design.md) for the full design and trade-offs.
+template restarts nothing. Every DaemonSet pod is born with a `schedulingGate`; the controller
+advances a wave by **ungating that wave's pods** (and deleting any left on an old template hash,
+which the DaemonSet recreates gated on the new one). Progress is *derived every reconcile* from
+each pod's template-hash label + scheduled + readiness (level-based, restart-safe) — never
+remembered. See [docs/reconcile-design.md](docs/reconcile-design.md) for the full design and trade-offs.
 
 ```mermaid
 flowchart TD

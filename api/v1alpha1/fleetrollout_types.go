@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -26,14 +27,28 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // FleetRolloutSpec defines the desired state of FleetRollout.
+// Exactly one of image or template must be set.
+// +kubebuilder:validation:XValidation:rule="has(self.image) != has(self.template)",message="exactly one of spec.image and spec.template must be set"
 type FleetRolloutSpec struct {
 	// targetSelector selects the fleet's target nodes (e.g. edge/robot nodes) by label.
 	// +required
 	TargetSelector metav1.LabelSelector `json:"targetSelector"`
 
-	// image is the container image to progressively roll out across the fleet.
-	// +required
-	Image string `json:"image"`
+	// image is shorthand for a minimal single-container pod template (container name "agent")
+	// running this image. Mutually exclusive with template — use template for real agents that
+	// need volumes, env, resources, securityContext, etc.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// template is the full pod template to roll progressively across the fleet. The controller
+	// injects nodeSelector (from targetSelector), owner/template-hash labels, and a scheduling
+	// gate; those fields are reserved and must not be set by the user (see validation rules).
+	// A change to ANY template field (image, env, resources, ...) is a new rollout.
+	// +kubebuilder:validation:XValidation:rule="!has(self.spec.schedulingGates) || self.spec.schedulingGates.size() == 0",message="spec.template.spec.schedulingGates is managed by the controller"
+	// +kubebuilder:validation:XValidation:rule="!has(self.spec.nodeSelector)",message="use spec.targetSelector; template.spec.nodeSelector is injected by the controller"
+	// +kubebuilder:validation:XValidation:rule="self.spec.containers.size() >= 1",message="template must define at least one container"
+	// +optional
+	Template *corev1.PodTemplateSpec `json:"template,omitempty"`
 
 	// waveSize is the number of nodes updated per wave — a count (e.g. 5) or a
 	// percentage of the selected fleet (e.g. "20%").
@@ -88,14 +103,20 @@ const (
 	PhaseDone        FleetRolloutPhase = "Done"
 )
 
-// RolloutPlan is an immutable snapshot of the wave partition for one (image, generation).
+// RolloutPlan is an immutable snapshot of the wave partition for one (templateHash, generation).
 // Wave w is the node slice Nodes[w*WaveSize : min((w+1)*WaveSize, len(Nodes))]. Gate latches
 // (GatedWaves) live inside the plan so replacing the plan atomically clears them — a passed
 // gate can never authorize promotion over a different node set than the one it verified (C2).
 type RolloutPlan struct {
-	// image this plan rolls out; the plan is stale if it differs from the current desired image.
+	// templateHash identifies the rolled artifact (hash of the rendered base pod template); the
+	// plan is stale if it differs from the current desired hash. Any template field change
+	// (image, env, resources, ...) changes the hash and triggers a re-plan.
 	// +required
-	Image string `json:"image"`
+	TemplateHash string `json:"templateHash"`
+
+	// image is the rolled image (shorthand image, or the first container's image), for display only.
+	// +optional
+	Image string `json:"image,omitempty"`
 
 	// generation of the spec this plan was computed from; a spec change re-plans and resets gates.
 	// +required
@@ -130,16 +151,36 @@ type RolloutPlan struct {
 	GateStartedAt *metav1.Time `json:"gateStartedAt,omitempty"`
 }
 
-// RollbackStatus records an in-flight (or completed-and-sticky) rollback to the last-good image.
+// RollbackStatus records an in-flight (or completed-and-sticky) rollback to the last-good template.
 type RollbackStatus struct {
-	// fromImage is the spec.image that failed its gate; a spec.image different from this value
-	// supersedes and abandons the rollback (roll forward to the new image instead).
+	// fromHash is the desired template hash that failed its gate; a current desired hash different
+	// from this value supersedes and abandons the rollback (roll forward to the new template instead).
 	// +required
-	FromImage string `json:"fromImage"`
+	FromHash string `json:"fromHash"`
+
+	// fromImage is the image that failed its gate, for display only.
+	// +optional
+	FromImage string `json:"fromImage,omitempty"`
 
 	// startedAt is when the rollback was triggered.
 	// +optional
 	StartedAt metav1.Time `json:"startedAt,omitempty"`
+}
+
+// LastGood is the most recent template that completed a rollout (reached Done) — the rollback
+// target. The rendered base template is stored so a rollback can re-render the DaemonSet from it.
+type LastGood struct {
+	// templateHash of the last-good rendered base template.
+	// +required
+	TemplateHash string `json:"templateHash"`
+
+	// image of the last-good template, for display only.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// template is the rendered base pod template (pre-injection) to roll back to.
+	// +required
+	Template corev1.PodTemplateSpec `json:"template"`
 }
 
 // FleetRolloutStatus defines the observed state of FleetRollout.
@@ -164,10 +205,10 @@ type FleetRolloutStatus struct {
 	// +optional
 	UpdatedNodes int32 `json:"updatedNodes,omitempty"`
 
-	// lastGoodImage is the most recent image that completed a rollout (reached Done); the
-	// rollback target. Controller-owned in status so GitOps pruning cannot strip it.
+	// lastGood is the most recent template that completed a rollout (reached Done); the rollback
+	// target. Controller-owned in status so GitOps pruning cannot strip it.
 	// +optional
-	LastGoodImage string `json:"lastGoodImage,omitempty"`
+	LastGood *LastGood `json:"lastGood,omitempty"`
 
 	// rollback is non-nil while a rollback is in flight or sticky-completed (phase RolledBack).
 	// +optional
