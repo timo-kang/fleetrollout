@@ -133,7 +133,7 @@ Explicitly **deprioritized** (defensible cut lines): OLM packaging, conversion w
 | Move all controller state annotations → `status` (lastGoodImage, rollback, gate latches); add `observedGeneration` everywhere; phase enum; `spec.paused` | C6/API2/API3 | M | ✅ state fully in `status` (`lastGoodImage`, `rollback`, `plan`); `observedGeneration` on status + every condition; `FleetRolloutPhase` enum; one-time legacy-annotation strip. `spec.paused` deferred |
 | `minSoakSeconds` on the gate | H4 | S | ⬜ |
 | Events (EventRecorder at every transition) | O2 | S | ⬜ |
-| **CI e2e on kind covering waves/gate/rollback/restart** (+ fake-DS unit tests) | T1/T2 | L — do it first; it protects every other change in this table | 🔄 fake-client state-machine unit tests landed; full stub-Prometheus lifecycle e2e next |
+| **CI e2e on kind covering waves/gate/rollback/restart** (+ fake-DS unit tests) | T1/T2 | L — do it first; it protects every other change in this table | ✅ fake-client state-machine unit tests + full stub-Prometheus lifecycle e2e (3-worker kind): S1 healthy→Done, S2 gate-fail→rollback, S3 unreachable→hold (C1), S4 gate-fail+Never→Paused. Runs on every push via test-e2e.yml. (controller-restart-mid-rollout case deferred to v1.0/T3) |
 
 ### v0.3 — "Deploys real agents, installable" (the adoption release)
 
