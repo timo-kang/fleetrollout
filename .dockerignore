@@ -2,6 +2,11 @@
 # Ignore everything by default and re-include only needed files
 **
 
+# Re-include directories first so files inside them can be re-included below.
+# Without this, `**` excludes the directories themselves and Docker cannot descend
+# into e.g. cmd/ to pick up cmd/main.go (behavior varies by Docker/BuildKit version).
+!**/
+
 # Re-include Go source files (but not *_test.go)
 !**/*.go
 **/*_test.go

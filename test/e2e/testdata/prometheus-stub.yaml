@@ -1,0 +1,72 @@
+# Stub Prometheus servers for e2e health-gate scenarios.
+# hashicorp/http-echo replies to EVERY path (incl. /api/v1/query?query=...) with a fixed body,
+# so we serve a Prometheus instant-query response shaped exactly like the real API.
+#   prom-healthy   → one sample, value "1"  → evalPromQL: healthy=true,  reachable=true
+#   prom-unhealthy → one sample, value "0"  → evalPromQL: healthy=false, reachable=true
+# "Unreachable" needs no server — point the gate at a non-existent Service name.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-healthy
+  namespace: fleet-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prom-healthy }
+  template:
+    metadata:
+      labels: { app: prom-healthy }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0.0
+          args:
+            - "-listen=:9090"
+            - '-text={"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"1"]}]}}'
+          ports:
+            - containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prom-healthy
+  namespace: fleet-monitoring
+spec:
+  selector: { app: prom-healthy }
+  ports:
+    - port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-unhealthy
+  namespace: fleet-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prom-unhealthy }
+  template:
+    metadata:
+      labels: { app: prom-unhealthy }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0.0
+          args:
+            - "-listen=:9090"
+            - '-text={"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"0"]}]}}'
+          ports:
+            - containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prom-unhealthy
+  namespace: fleet-monitoring
+spec:
+  selector: { app: prom-unhealthy }
+  ports:
+    - port: 9090
+      targetPort: 9090

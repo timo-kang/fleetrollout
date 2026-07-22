@@ -1,0 +1,10 @@
+# Multi-worker Kind cluster for FleetRollout e2e (control-plane + 3 workers).
+# Waves need real worker nodes to be meaningful; workers are labeled fleet-group=field-robots
+# by `make setup-test-e2e` after creation.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

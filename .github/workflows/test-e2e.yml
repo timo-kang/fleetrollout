@@ -33,6 +33,9 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
+        env:
+          # No webhooks in this project, so CertManager is unnecessary — skip it for speed/reliability.
+          CERT_MANAGER_INSTALL_SKIP: "true"
         run: |
           go mod tidy
           make test-e2e
