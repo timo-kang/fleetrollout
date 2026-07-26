@@ -24,6 +24,10 @@ spec:
     - jsonPath: .status.updatedNodes
       name: Updated
       type: integer
+    - jsonPath: .status.skippedNodes[*]
+      name: Skipped
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -17360,6 +17364,15 @@ spec:
                 required:
                 - fromHash
                 type: object
+              skippedNodes:
+                description: |-
+                  skippedNodes are planned nodes currently NotReady and not yet updated — excluded from wave
+                  progress so one dead edge box can't wedge the fleet. A rollout can reach Done with skipped
+                  nodes (surfaced as Degraded=True, reason NodesSkipped).
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
               totalWaves:
                 description: totalWaves is the total number of waves planned for this
                   rollout.

@@ -215,6 +215,13 @@ type FleetRolloutStatus struct {
 	// +optional
 	UpdatedNodes int32 `json:"updatedNodes,omitempty"`
 
+	// skippedNodes are planned nodes currently NotReady and not yet updated — excluded from wave
+	// progress so one dead edge box can't wedge the fleet. A rollout can reach Done with skipped
+	// nodes (surfaced as Degraded=True, reason NodesSkipped).
+	// +listType=atomic
+	// +optional
+	SkippedNodes []string `json:"skippedNodes,omitempty"`
+
 	// lastGood is the most recent template that completed a rollout (reached Done); the rollback
 	// target. Controller-owned in status so GitOps pruning cannot strip it.
 	// +optional
@@ -241,6 +248,7 @@ type FleetRolloutStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Wave",type=integer,JSONPath=`.status.currentWave`
 // +kubebuilder:printcolumn:name="Updated",type=integer,JSONPath=`.status.updatedNodes`
+// +kubebuilder:printcolumn:name="Skipped",type=string,JSONPath=`.status.skippedNodes[*]`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // FleetRollout is the Schema for the fleetrollouts API

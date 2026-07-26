@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -66,6 +67,29 @@ func readyNode(name string) *corev1.Node {
 			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
 		},
 	}
+}
+
+// setNodeNotReady flips a node's Ready condition to False in the fake client.
+func setNodeNotReady(t *testing.T, c client.Client, name string) {
+	t.Helper()
+	node := &corev1.Node{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name}, node); err != nil {
+		t.Fatalf("get node %s: %v", name, err)
+	}
+	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+	if err := c.Status().Update(context.Background(), node); err != nil {
+		t.Fatalf("mark %s NotReady: %v", name, err)
+	}
+}
+
+// degradedReason returns the reason of the Degraded condition, or "" if absent/False.
+func degradedReason(fr *fleetv1alpha1.FleetRollout) string {
+	for _, c := range fr.Status.Conditions {
+		if c.Type == strDegraded && c.Status == metav1.ConditionTrue {
+			return c.Reason
+		}
+	}
+	return ""
 }
 
 func newFleetRollout(waveSize string) *fleetv1alpha1.FleetRollout {
@@ -469,5 +493,67 @@ func TestSteadyStateAdoptionAtDone(t *testing.T) {
 
 	if podIsGated(t, c, "n9") {
 		t.Error("a node joining after Done should be adopted (its current-template pod ungated)")
+	}
+}
+
+// TestSkippedNodesSurfaced (C8): a planned node that goes NotReady is excluded from progress,
+// surfaced in status.skippedNodes, and the rollout can still reach Done as Degraded(NodesSkipped).
+func TestSkippedNodesSurfaced(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("50%")
+	hash := frTemplateHash(fr)
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2"), ownedPod("n1", hash)).
+		Build()
+
+	reconcileOnce(t, c) // freeze plan over {n1,n2}
+	setNodeNotReady(t, c, "n2")
+	got := reconcileOnce(t, c)
+
+	if got.Status.Phase != fleetv1alpha1.PhaseDone {
+		t.Fatalf("phase = %q, want Done (n1 updated, n2 skipped)", got.Status.Phase)
+	}
+	if len(got.Status.SkippedNodes) != 1 || got.Status.SkippedNodes[0] != "n2" {
+		t.Errorf("skippedNodes = %v, want [n2]", got.Status.SkippedNodes)
+	}
+	if r := degradedReason(got); r != "NodesSkipped" {
+		t.Errorf("Degraded reason = %q, want NodesSkipped", r)
+	}
+}
+
+// TestStuckTerminatingSurfaced (C7): a pod wedged Terminating past the threshold surfaces as
+// Degraded(PodStuckTerminating) — the controller never force-deletes it.
+func TestStuckTerminatingSurfaced(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("50%")
+	hash := frTemplateHash(fr)
+	// A pod on n1 stuck Terminating: finalizer holds it after Delete so it keeps a deletionTimestamp.
+	stuck := ownedPod("n1", hash)
+	stuck.Finalizers = []string{"test/hold"}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2"), stuck, ownedPod("n2", hash)).
+		Build()
+	if err := c.Delete(context.Background(), stuck); err != nil { // sets deletionTimestamp; finalizer keeps it
+		t.Fatalf("delete stuck pod: %v", err)
+	}
+
+	// Threshold ~0 so the just-deleted pod counts as stuck immediately.
+	r := &FleetRolloutReconciler{Client: c, Scheme: c.Scheme(), StuckThreshold: time.Nanosecond}
+	if _, err := r.Reconcile(context.Background(), reconcileReq()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := &fleetv1alpha1.FleetRollout{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: frName, Namespace: nsDefault}, got); err != nil {
+		t.Fatalf("get fr: %v", err)
+	}
+
+	if r := degradedReason(got); r != "PodStuckTerminating" {
+		t.Errorf("Degraded reason = %q, want PodStuckTerminating", r)
+	}
+	// The stuck pod must NOT have been force-deleted (finalizer still present, still there).
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "pod-n1", Namespace: nsDefault}, &corev1.Pod{}); err != nil {
+		t.Errorf("stuck pod must not be force-deleted, got %v", err)
 	}
 }

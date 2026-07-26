@@ -64,11 +64,17 @@ const (
 	promQLTimeout     = 5 * time.Second
 	defaultTimeout    = 300 * time.Second
 
+	// defaultStuckThreshold is how long a pod may sit Terminating before the rollout surfaces it as
+	// Degraded. The controller never force-deletes (unsafe on edge nodes) — it only makes the wedge
+	// visible with the node name.
+	defaultStuckThreshold = 5 * time.Minute
+
 	// condition-type string constants
 	strProgressing = "Progressing"
 	strRolledBack  = "RolledBack"
 	strRollingBack = "RollingBack"
 	strHealthGate  = "HealthGatePassed"
+	strDegraded    = "Degraded"
 )
 
 // FleetRolloutReconciler reconciles a FleetRollout object
@@ -77,6 +83,16 @@ type FleetRolloutReconciler struct {
 	Scheme *runtime.Scheme
 	// HTTP is used to evaluate PromQL health gates; overridable in tests.
 	HTTP *http.Client
+	// StuckThreshold overrides how long a pod may sit Terminating before being surfaced as stuck
+	// (0 = defaultStuckThreshold). Overridable in tests.
+	StuckThreshold time.Duration
+}
+
+func (r *FleetRolloutReconciler) stuckThreshold() time.Duration {
+	if r.StuckThreshold > 0 {
+		return r.StuckThreshold
+	}
+	return defaultStuckThreshold
 }
 
 // +kubebuilder:rbac:groups=fleet.fleetrollout.io,resources=fleetrollouts,verbs=get;list;watch;create;update;patch;delete
@@ -162,7 +178,7 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	n := len(nodeNames)
 	if n == 0 {
 		setCond(&fr, metav1.Condition{
-			Type: "Degraded", Status: metav1.ConditionTrue, Reason: "NoTargetNodes",
+			Type: strDegraded, Status: metav1.ConditionTrue, Reason: "NoTargetNodes",
 			Message: "no Ready nodes match spec.targetSelector",
 		})
 		fr.Status.Phase = fleetv1alpha1.PhaseProgressing
@@ -250,15 +266,24 @@ func (r *FleetRolloutReconciler) reconcileForward(ctx context.Context, log logr,
 	eligible := func(node string) bool { return readySet[node] }
 
 	updatedCount, pendingCount := 0, 0
+	var skippedNodes, stuckNodes []string
 	for _, node := range plan.Nodes {
 		switch {
 		case updated(node):
 			updatedCount++
 		case eligible(node):
 			pendingCount++
+		default:
+			skippedNodes = append(skippedNodes, node) // planned, NotReady, not updated (C8)
+		}
+		if p := podByNode[node]; p != nil && !p.DeletionTimestamp.IsZero() &&
+			time.Since(p.DeletionTimestamp.Time) > r.stuckThreshold() {
+			stuckNodes = append(stuckNodes, node) // pod wedged Terminating past the threshold (C7)
 		}
 	}
 	fr.Status.UpdatedNodes = int32(updatedCount)
+	fr.Status.SkippedNodes = skippedNodes
+	r.setDegraded(fr, skippedNodes, stuckNodes)
 
 	waveFullyUpdated := func(w int) bool {
 		start, end := w*size, min((w+1)*size, len(plan.Nodes))
@@ -448,7 +473,7 @@ func (r *FleetRolloutReconciler) reconcileRollback(ctx context.Context, log logr
 		})
 		setCond(fr, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: strRolledBack})
 		setCond(fr, metav1.Condition{
-			Type: "Degraded", Status: metav1.ConditionTrue, Reason: strRolledBack,
+			Type: strDegraded, Status: metav1.ConditionTrue, Reason: strRolledBack,
 			Message: "rolled back after health-gate failure; edit spec to retry",
 		})
 		return r.finish(ctx, fr, ctrl.Result{})
@@ -664,6 +689,28 @@ func (r *FleetRolloutReconciler) ungate(ctx context.Context, pod *corev1.Pod) er
 func setCond(fr *fleetv1alpha1.FleetRollout, c metav1.Condition) {
 	c.ObservedGeneration = fr.Generation
 	apimeta.SetStatusCondition(&fr.Status.Conditions, c)
+}
+
+// setDegraded surfaces node-level trouble on the Degraded condition: pods wedged Terminating (C7)
+// take priority over NotReady-skipped nodes (C8); otherwise the fleet is healthy. The controller
+// never force-deletes stuck pods — it only makes the wedge visible with the node names.
+func (r *FleetRolloutReconciler) setDegraded(fr *fleetv1alpha1.FleetRollout, skipped, stuck []string) {
+	switch {
+	case len(stuck) > 0:
+		setCond(fr, metav1.Condition{
+			Type: strDegraded, Status: metav1.ConditionTrue, Reason: "PodStuckTerminating",
+			Message: fmt.Sprintf("pods stuck Terminating on nodes %v (not force-deleting)", stuck),
+		})
+	case len(skipped) > 0:
+		setCond(fr, metav1.Condition{
+			Type: strDegraded, Status: metav1.ConditionTrue, Reason: "NodesSkipped",
+			Message: fmt.Sprintf("planned nodes NotReady, excluded from progress: %v", skipped),
+		})
+	default:
+		setCond(fr, metav1.Condition{
+			Type: strDegraded, Status: metav1.ConditionFalse, Reason: "AllNodesReady",
+		})
+	}
 }
 
 // stripLegacyAnnotations removes any pre-status controller-state annotations (one-time migration).
