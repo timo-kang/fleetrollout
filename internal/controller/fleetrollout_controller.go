@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -34,13 +35,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	fleetv1alpha1 "github.com/timo-kang/fleetrollout/api/v1alpha1"
@@ -825,12 +831,48 @@ type logr = interface {
 	Info(msg string, keysAndValues ...any)
 }
 
+// nodePredicate drops heartbeat-only Node updates: on an update, enqueue only when the labels or
+// the Ready condition actually change. Create/Delete/Generic still enqueue (predicate.Funcs
+// defaults). On a flapping edge fleet this prevents a reconcile storm from per-second Node writes.
+func nodePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok1 := e.ObjectOld.(*corev1.Node)
+			newNode, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 {
+				return true
+			}
+			return !maps.Equal(oldNode.Labels, newNode.Labels) || nodeReady(oldNode) != nodeReady(newNode)
+		},
+	}
+}
+
+// ownerLabelSelector matches any pod carrying the owner label (its value is a FleetRollout name).
+func ownerLabelSelector() labels.Selector {
+	req, err := labels.NewRequirement(ownerLabel, selection.Exists, nil)
+	if err != nil {
+		return labels.Everything()
+	}
+	return labels.NewSelector().Add(*req)
+}
+
+// ScopedCacheOptions restricts the Pod informer to pods this operator owns (owner label present),
+// a large memory saving on big clusters. Nodes / DaemonSets / FleetRollouts are cached normally.
+func ScopedCacheOptions() cache.Options {
+	return cache.Options{
+		ByObject: map[client.Object]cache.ByObject{
+			&corev1.Pod{}: {Label: ownerLabelSelector()},
+		},
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *FleetRolloutReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&fleetv1alpha1.FleetRollout{}).
 		Owns(&appsv1.DaemonSet{}).
-		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.rolloutsForNode)).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.rolloutsForNode),
+			builder.WithPredicates(nodePredicate())).
 		Named("fleetrollout").
 		Complete(r)
 }
