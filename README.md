@@ -78,6 +78,28 @@ flowchart TD
 - [x] Node watch, unit tests, kind e2e, Helm chart
 - [ ] Offline-node re-join convergence; envtest; richer gates (thresholds, multi-query)
 
+## Install
+
+Published on every `v*` tag: a multi-arch (amd64 + arm64) image and an OCI Helm chart on
+GHCR, plus a consolidated manifest attached to the [GitHub Release](https://github.com/timo-kang/fleetrollout/releases).
+Requires Kubernetes 1.27+ (pod `schedulingGates`).
+
+**Helm (OCI):**
+
+```sh
+helm install fleetrollout \
+  oci://ghcr.io/timo-kang/charts/fleetrollout \
+  --namespace fleetrollout-system --create-namespace
+```
+
+**Raw manifest** (server-side apply — the CRD embeds a full PodTemplateSpec, so it exceeds the
+client-side apply annotation limit):
+
+```sh
+kubectl apply --server-side -f \
+  https://github.com/timo-kang/fleetrollout/releases/latest/download/install.yaml
+```
+
 ## Try it locally (kind)
 
 ```sh
@@ -86,12 +108,6 @@ kubectl label nodes -l '!node-role.kubernetes.io/control-plane' fleet-group=fiel
 make install && make run                               # CRDs + run controller locally
 kubectl apply -f config/samples/                       # a sample FleetRollout
 kubectl get fleetrollout -w
-```
-
-Install via Helm (generated chart):
-
-```sh
-helm install fleetrollout ./dist/chart
 ```
 
 Requires Go 1.24+, `kubebuilder`, `kind`, and `helm`.

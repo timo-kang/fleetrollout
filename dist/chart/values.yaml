@@ -3,7 +3,8 @@ controllerManager:
   replicas: 1
   container:
     image:
-      repository: controller
+      # Default to the published GHCR image; the release workflow pins tag to the chart version.
+      repository: ghcr.io/timo-kang/fleetrollout
       tag: latest
     imagePullPolicy: IfNotPresent
     args:
