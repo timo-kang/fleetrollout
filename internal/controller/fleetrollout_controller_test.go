@@ -106,4 +106,69 @@ var _ = Describe("FleetRollout Controller", func() {
 			Expect(fr.Status.TotalWaves).To(Equal(int32(2)))
 		})
 	})
+
+	// CEL / schema validation is enforced by the real API server in envtest.
+	Context("Spec validation (CEL)", func() {
+		const ns = "default"
+		sel := metav1.LabelSelector{MatchLabels: map[string]string{"fleet-group": "field-robots"}}
+		base := func() *fleetv1alpha1.FleetRollout {
+			return &fleetv1alpha1.FleetRollout{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "cel-", Namespace: ns},
+				Spec:       fleetv1alpha1.FleetRolloutSpec{TargetSelector: sel},
+			}
+		}
+		gate := func(url, query string, timeout int32) *fleetv1alpha1.HealthGate {
+			return &fleetv1alpha1.HealthGate{PrometheusURL: url, Query: query, TimeoutSeconds: timeout}
+		}
+		ctx := context.Background()
+
+		DescribeTable("rejects invalid specs and accepts valid ones",
+			func(mutate func(*fleetv1alpha1.FleetRollout), wantAccept bool) {
+				fr := base()
+				mutate(fr)
+				err := k8sClient.Create(ctx, fr)
+				if wantAccept {
+					Expect(err).NotTo(HaveOccurred())
+					Expect(k8sClient.Delete(ctx, fr)).To(Succeed())
+				} else {
+					Expect(err).To(HaveOccurred())
+				}
+			},
+			Entry("neither image nor template", func(fr *fleetv1alpha1.FleetRollout) {}, false),
+			Entry("both image and template", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.Template = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: agentContainer, Image: frImage}}}}
+			}, false),
+			Entry("template with user nodeSelector", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Template = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					NodeSelector: map[string]string{"foo": "bar"},
+					Containers:   []corev1.Container{{Name: agentContainer, Image: frImage}}}}
+			}, false),
+			Entry("waveSize 0%", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.WaveSize = intstr.FromString("0%")
+			}, false),
+			Entry("waveSize abc%", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.WaveSize = intstr.FromString("abc%")
+			}, false),
+			Entry("waveSize 20% valid", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.WaveSize = intstr.FromString("20%")
+			}, true),
+			Entry("negative timeout", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = gate("http://p:9090", "up", -5)
+			}, false),
+			Entry("ftp prometheusURL (SSRF)", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = gate("ftp://evil/x", "up", 60)
+			}, false),
+			Entry("valid https healthGate", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = gate("https://p:9090", "up", 60)
+			}, true),
+		)
+	})
 })

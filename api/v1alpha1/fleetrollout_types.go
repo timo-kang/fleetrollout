@@ -37,6 +37,7 @@ type FleetRolloutSpec struct {
 	// image is shorthand for a minimal single-container pod template (container name "agent")
 	// running this image. Mutually exclusive with template — use template for real agents that
 	// need volumes, env, resources, securityContext, etc.
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -50,9 +51,11 @@ type FleetRolloutSpec struct {
 	// +optional
 	Template *corev1.PodTemplateSpec `json:"template,omitempty"`
 
-	// waveSize is the number of nodes updated per wave — a count (e.g. 5) or a
-	// percentage of the selected fleet (e.g. "20%").
+	// waveSize is the number of nodes updated per wave — a positive count (e.g. 5) or a
+	// positive percentage of the selected fleet (e.g. "20%"). An integer 0 means "unset" (the
+	// controller uses the 20% default); a "0%"/"abc%" string is rejected.
 	// +kubebuilder:default="20%"
+	// +kubebuilder:validation:XValidation:rule="type(self) == int ? self >= 0 : self.matches('^[1-9][0-9]*%$')",message="waveSize must be a positive integer or a positive percentage like \"20%\""
 	// +optional
 	WaveSize intstr.IntOrString `json:"waveSize,omitempty"`
 
@@ -68,16 +71,23 @@ type FleetRolloutSpec struct {
 
 // HealthGate is a promotion gate evaluated between waves.
 type HealthGate struct {
-	// prometheusURL is the base URL of the Prometheus server to query.
+	// prometheusURL is the base URL of the Prometheus server to query. Must be http(s) — the scheme
+	// is allowlisted to blunt SSRF (a FleetRollout author would otherwise make the controller GET an
+	// arbitrary in-cluster URL from its serviceaccount identity).
+	// +kubebuilder:validation:XValidation:rule="self.startsWith('http://') || self.startsWith('https://')",message="prometheusURL must start with http:// or https://"
 	// +required
 	PrometheusURL string `json:"prometheusURL"`
 
 	// query is a PromQL expression; the wave is healthy when it returns a truthy, non-empty result.
+	// +kubebuilder:validation:MinLength=1
 	// +required
 	Query string `json:"query"`
 
-	// timeoutSeconds is how long to wait for the gate to pass before failing the wave.
+	// timeoutSeconds is how long to wait for the gate to pass before failing the wave (0 = default
+	// 300s). Negative values are rejected — they would make the gate time out instantly and, under
+	// rollbackPolicy=OnFailure, trigger an immediate rollback.
 	// +kubebuilder:default=300
+	// +kubebuilder:validation:Minimum=0
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 }

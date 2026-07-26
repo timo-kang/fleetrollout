@@ -375,7 +375,7 @@ func TestTemplateFieldChangeTriggersRollout(t *testing.T) {
 	s := planTestScheme(t)
 	tmpl := func(logLevel string) *corev1.PodTemplateSpec {
 		return &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-			Name: agentContainer, Image: "img:v1",
+			Name: agentContainer, Image: frImage,
 			Env: []corev1.EnvVar{{Name: "LOG_LEVEL", Value: logLevel}},
 		}}}}
 	}
