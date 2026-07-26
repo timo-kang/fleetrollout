@@ -143,10 +143,10 @@ Explicitly **deprioritized** (defensible cut lines): OLM packaging, conversion w
 | First-deploy + node-join gating via pod `schedulingGates` ungated per wave | C4 | ✅ DS template carries a `fleetrollout.../wave` scheduling gate → every DS-created pod is born SchedulingGated; the controller ungates per wave (Rule A deletes gated+stale for free; a wave is ungated only after the prior gate passed). Closes first-deploy mass-scheduling AND node-join bypass (a joining node's pod stays gated **during** a rollout). e2e S5 proves a fresh deploy schedules only wave 0 while future waves stay SchedulingGated. Steady-state adoption: once the rollout is **Done** (current template fully gate-passed), a node that joins afterward is adopted — its gated pod is ungated (unit-tested, sabotage-verified; inert for in-flight rollouts). |
 | Gate auth/TLS (`secretRef`, CA bundle) + operators/thresholds + per-wave query templating | H2/H3 | ⬜ |
 | CEL validation (image, waveSize, timeout, URL scheme) | API1/SEC2 | ✅ XOR image/template, no user schedulingGates/nodeSelector/reserved-labels, ≥1 container; non-empty image/query; waveSize positive int-or-`N%` (int 0 = "unset"→default); timeout ≥ 0 (rejects instant-rollback negatives); **prometheusURL scheme allowlisted to http(s) (SSRF, SEC2)**. envtest DescribeTable + verified on kind. |
-| Prometheus metrics for the operator itself + Grafana dashboard JSON in-repo | O1 |
-| GHCR multi-arch (amd64+arm64) images, tagged releases, published Helm chart | REL1/REL2 |
-| Stuck-pod detection condition + `skippedNodes` surfacing | C7/C8 |
-| Node-event filtering; pod cache label-scoping | S1/S3 |
+| Prometheus metrics for the operator itself + Grafana dashboard JSON in-repo | O1 | 🔄 Custom metrics on the controller-runtime `/metrics` endpoint: `fleetrollout_gate_evaluations_total{result}`, `_wave_promotions_total`, `_rollbacks_total` (counters); `_updated_nodes`, `_total_waves`, `_phase{phase}` (per-CR gauges, series dropped on CR delete). Unit + sabotage tests; verified live on kind (scraped + forget-on-delete). Grafana dashboard JSON still ⬜ |
+| GHCR multi-arch (amd64+arm64) images, tagged releases, published Helm chart | REL1/REL2 | ⬜ |
+| Stuck-pod detection condition + `skippedNodes` surfacing | C7/C8 | ⬜ |
+| Node-event filtering; pod cache label-scoping | S1/S3 | ⬜ |
 
 ### v1.0 — "Trustworthy" (the credibility release)
 

@@ -79,6 +79,11 @@ func newFleetRollout(waveSize string) *fleetv1alpha1.FleetRollout {
 	}
 }
 
+// reconcileReq is the reconcile.Request for the shared test FleetRollout.
+func reconcileReq() reconcile.Request {
+	return reconcile.Request{NamespacedName: types.NamespacedName{Name: frName, Namespace: nsDefault}}
+}
+
 // reconcileOnce runs one Reconcile pass and returns the refreshed FleetRollout.
 func reconcileOnce(t *testing.T, c client.Client) *fleetv1alpha1.FleetRollout {
 	t.Helper()

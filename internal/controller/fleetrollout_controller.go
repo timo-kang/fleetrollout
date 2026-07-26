@@ -29,6 +29,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -94,6 +95,9 @@ func (r *FleetRolloutReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	var fr fleetv1alpha1.FleetRollout
 	if err := r.Get(ctx, req.NamespacedName, &fr); err != nil {
+		if apierrors.IsNotFound(err) {
+			forgetCRMetrics(req.Namespace, req.Name) // drop per-CR gauge series for a deleted rollout
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !fr.DeletionTimestamp.IsZero() {
@@ -492,6 +496,8 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 
 	switch decideGate(reachable, healthy, timedOut, onFailure, hasLastGood) {
 	case gatePass:
+		gateEvaluationsTotal.WithLabelValues("pass").Inc()
+		wavePromotionsTotal.Inc()
 		plan.GatedWaves = int32(wave) + 1
 		plan.EvaluatingWave, plan.GateStartedAt = nil, nil
 		setCond(fr, metav1.Condition{
@@ -501,9 +507,11 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		log.Info("health gate passed", "wave", wave)
 		return gateDecision{promote: true, res: ctrl.Result{Requeue: true}}
 	case gateRollback:
+		gateEvaluationsTotal.WithLabelValues("rollback").Inc()
 		log.Info("health gate unhealthy past timeout → rolling back", "wave", wave)
 		return gateDecision{rollback: true}
 	case gatePauseTimeout:
+		gateEvaluationsTotal.WithLabelValues("pause").Inc()
 		reason, msg := "Timeout", fmt.Sprintf("wave %d gate unhealthy past %s", wave, timeout)
 		if onFailure && !hasLastGood {
 			reason, msg = "NoKnownGoodImage", "gate unhealthy past timeout and no known-good template to roll back to"
@@ -515,6 +523,7 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		log.Info("health gate unhealthy past timeout → paused", "wave", wave)
 		return gateDecision{paused: true}
 	default: // gateWait — includes unreachable, which NEVER escalates (no data ≠ unhealthy)
+		gateEvaluationsTotal.WithLabelValues("wait").Inc()
 		reason, msg := "Evaluating", fmt.Sprintf("wave %d health gate not yet passed", wave)
 		if !reachable {
 			reason, msg = "MonitoringUnavailable", "Prometheus unreachable — holding, never rolling back on missing data"
@@ -608,6 +617,7 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 // onGateHold handles a non-promoting gate decision: trigger rollback (OnFailure) or wait (evaluating/Paused).
 func (r *FleetRolloutReconciler) onGateHold(ctx context.Context, fr *fleetv1alpha1.FleetRollout, d gateDecision) (ctrl.Result, error) {
 	if d.rollback {
+		rollbacksTotal.Inc()
 		fr.Status.Rollback = &fleetv1alpha1.RollbackStatus{
 			FromHash: fr.Status.Plan.TemplateHash, FromImage: fr.Status.Plan.Image, StartedAt: metav1.Now(),
 		}
@@ -621,11 +631,13 @@ func (r *FleetRolloutReconciler) onGateHold(ctx context.Context, fr *fleetv1alph
 	return r.finish(ctx, fr, d.res)
 }
 
-// finish persists the status subresource. Controller state lives entirely in status now.
+// finish persists the status subresource and reflects it into the operator metrics. Controller
+// state lives entirely in status now.
 func (r *FleetRolloutReconciler) finish(ctx context.Context, fr *fleetv1alpha1.FleetRollout, res ctrl.Result) (ctrl.Result, error) {
 	if err := r.Status().Update(ctx, fr); err != nil {
 		return ctrl.Result{}, err
 	}
+	recordStatusMetrics(fr)
 	return res, nil
 }
 
