@@ -183,6 +183,9 @@ func main() {
 	if err := (&controller.FleetRolloutReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// Uncached reader for health-gate credential Secrets/ConfigMaps (get-only RBAC; avoids
+		// caching every Secret in watched namespaces).
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "fleetrollout")
 		os.Exit(1)

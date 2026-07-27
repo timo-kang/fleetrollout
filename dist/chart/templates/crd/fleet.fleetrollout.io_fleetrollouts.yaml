@@ -66,6 +66,36 @@ spec:
                 description: healthGate optionally gates promotion to the next wave
                   on a PromQL check.
                 properties:
+                  auth:
+                    description: auth optionally authenticates to Prometheus (bearer
+                      token or basic auth from a Secret).
+                    properties:
+                      secretRef:
+                        description: secretRef names the Secret (in the FleetRollout's
+                          namespace) holding the credentials.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      type:
+                        description: 'type selects the scheme: "bearer" reads Secret
+                          key "token"; "basic" reads "username" + "password".'
+                        enum:
+                        - bearer
+                        - basic
+                        type: string
+                    required:
+                    - secretRef
+                    - type
+                    type: object
                   prometheusURL:
                     description: |-
                       prometheusURL is the base URL of the Prometheus server to query. Must be http(s) — the scheme
@@ -139,6 +169,41 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  tls:
+                    description: tls optionally configures TLS for the Prometheus
+                      connection (custom CA, server name).
+                    properties:
+                      caRef:
+                        description: |-
+                          caRef optionally supplies a CA bundle (key "ca.crt") to verify the server certificate.
+                          Mutually exclusive with insecureSkipVerify.
+                        properties:
+                          kind:
+                            default: ConfigMap
+                            description: 'kind is the source object type: Secret or
+                              ConfigMap.'
+                            enum:
+                            - Secret
+                            - ConfigMap
+                            type: string
+                          name:
+                            description: name is the Secret/ConfigMap name.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      insecureSkipVerify:
+                        description: insecureSkipVerify disables server-certificate
+                          verification (discouraged; last resort).
+                        type: boolean
+                      serverName:
+                        description: serverName overrides the SNI / certificate server
+                          name used for verification.
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: tls.caRef and tls.insecureSkipVerify are mutually exclusive
+                      rule: '!(has(self.caRef) && self.insecureSkipVerify)'
                 required:
                 - prometheusURL
                 type: object

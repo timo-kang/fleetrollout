@@ -105,6 +105,8 @@ func newFleetRollout(waveSize string) *fleetv1alpha1.FleetRollout {
 	}
 }
 
+func ptr[T any](v T) *T { return &v }
+
 // reconcileReq is the reconcile.Request for the shared test FleetRollout.
 func reconcileReq() reconcile.Request {
 	return reconcile.Request{NamespacedName: types.NamespacedName{Name: frName, Namespace: nsDefault}}
@@ -557,5 +559,45 @@ func TestStuckTerminatingSurfaced(t *testing.T) {
 	// The stuck pod must NOT have been force-deleted (finalizer still present, still there).
 	if err := c.Get(context.Background(), types.NamespacedName{Name: "pod-n1", Namespace: nsDefault}, &corev1.Pod{}); err != nil {
 		t.Errorf("stuck pod must not be force-deleted, got %v", err)
+	}
+}
+
+// TestGateAuthConfigErrorHolds (H2): a gate referencing a missing auth Secret surfaces as
+// Degraded/HealthGateConfigValid=False and HOLDS — it must never roll back or pause (a config
+// error is not a monitoring signal; decideGate must not see it).
+func TestGateAuthConfigErrorHolds(t *testing.T) {
+	s := planTestScheme(t)
+	fr := newFleetRollout("50%")
+	fr.Spec.HealthGate = &fleetv1alpha1.HealthGate{
+		PrometheusURL: promTestURL, Query: "up", TimeoutSeconds: 1,
+		Auth: &fleetv1alpha1.GateAuth{Type: authBearer, SecretRef: corev1.LocalObjectReference{Name: "missing"}},
+	}
+	// Seed status so wave 0 is updated and the gate for promotion to wave 1 is consulted, with a
+	// last-good present (so a mistaken escalation WOULD roll back — proving the hold is real).
+	hash := frTemplateHash(fr)
+	fr.Status = fleetv1alpha1.FleetRolloutStatus{
+		LastGood: &fleetv1alpha1.LastGood{TemplateHash: "old", Image: lastGoodImg},
+		Plan: &fleetv1alpha1.RolloutPlan{
+			TemplateHash: hash, Image: frImage, Generation: 1, WaveSize: 1,
+			Nodes:          []string{"n1", "n2"},
+			EvaluatingWave: ptr(int32(0)),
+			GateStartedAt:  &metav1.Time{Time: metav1.Now().Add(-time.Hour)}, // long past timeout
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithStatusSubresource(&fleetv1alpha1.FleetRollout{}).
+		WithObjects(fr, readyNode("n1"), readyNode("n2"), ownedPod("n1", hash)). // n1 updated, n2 pending
+		Build()
+
+	got := reconcileOnce(t, c)
+
+	if p := got.Status.Phase; p == fleetv1alpha1.PhaseRolledBack || p == fleetv1alpha1.PhasePaused {
+		t.Errorf("phase = %q; a config error must not escalate to rollback/pause", p)
+	}
+	if got.Status.Rollback != nil {
+		t.Error("a missing auth secret must not trigger rollback")
+	}
+	if degradedReason(got) != "AuthSecretNotFound" {
+		t.Errorf("Degraded reason = %q, want AuthSecretNotFound", degradedReason(got))
 	}
 }

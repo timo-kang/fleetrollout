@@ -102,6 +102,58 @@ type HealthGate struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// auth optionally authenticates to Prometheus (bearer token or basic auth from a Secret).
+	// +optional
+	Auth *GateAuth `json:"auth,omitempty"`
+
+	// tls optionally configures TLS for the Prometheus connection (custom CA, server name).
+	// +optional
+	TLS *GateTLS `json:"tls,omitempty"`
+}
+
+// GateAuth authenticates the controller's Prometheus requests using credentials from a Secret in
+// the FleetRollout's namespace.
+type GateAuth struct {
+	// type selects the scheme: "bearer" reads Secret key "token"; "basic" reads "username" + "password".
+	// +kubebuilder:validation:Enum=bearer;basic
+	// +required
+	Type string `json:"type"`
+
+	// secretRef names the Secret (in the FleetRollout's namespace) holding the credentials.
+	// +required
+	SecretRef corev1.LocalObjectReference `json:"secretRef"`
+}
+
+// GateTLS configures TLS for the Prometheus connection.
+// +kubebuilder:validation:XValidation:rule="!(has(self.caRef) && self.insecureSkipVerify)",message="tls.caRef and tls.insecureSkipVerify are mutually exclusive"
+type GateTLS struct {
+	// caRef optionally supplies a CA bundle (key "ca.crt") to verify the server certificate.
+	// Mutually exclusive with insecureSkipVerify.
+	// +optional
+	CARef *CASourceReference `json:"caRef,omitempty"`
+
+	// insecureSkipVerify disables server-certificate verification (discouraged; last resort).
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+
+	// serverName overrides the SNI / certificate server name used for verification.
+	// +optional
+	ServerName string `json:"serverName,omitempty"`
+}
+
+// CASourceReference references a CA bundle in a Secret or ConfigMap (fixed key "ca.crt") in the
+// FleetRollout's namespace.
+type CASourceReference struct {
+	// kind is the source object type: Secret or ConfigMap.
+	// +kubebuilder:validation:Enum=Secret;ConfigMap
+	// +kubebuilder:default=ConfigMap
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// name is the Secret/ConfigMap name.
+	// +required
+	Name string `json:"name"`
 }
 
 // GateQuery is one PromQL check: the wave is healthy for this query when it returns at least one

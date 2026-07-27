@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -88,11 +89,23 @@ const (
 type FleetRolloutReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// HTTP is used to evaluate PromQL health gates; overridable in tests.
+	// HTTP is used to evaluate PromQL health gates; overridable in tests. When set, it is used
+	// verbatim (TLS config is ignored) so tests can inject an httptest client.
 	HTTP *http.Client
+	// APIReader reads health-gate credential Secrets/ConfigMaps uncached (get-only RBAC, no informer
+	// cache of every Secret). Falls back to the cached client when nil (tests).
+	APIReader client.Reader
 	// StuckThreshold overrides how long a pod may sit Terminating before being surfaced as stuck
 	// (0 = defaultStuckThreshold). Overridable in tests.
 	StuckThreshold time.Duration
+}
+
+// reader returns the uncached APIReader for credential reads, or the cached client if unset.
+func (r *FleetRolloutReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *FleetRolloutReconciler) stuckThreshold() time.Duration {
@@ -108,6 +121,7 @@ func (r *FleetRolloutReconciler) stuckThreshold() time.Duration {
 // +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get
 
 // Reconcile implements the level-triggered rollout loop. See docs/reconcile-design.md.
 // The rolled artifact is a full pod template identified by a hash; scheduling is wave-bounded via
@@ -517,7 +531,27 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		plan.GateStartedAt = &now
 	}
 
-	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, normalizeQueries(gate))
+	// Resolve auth/TLS BEFORE evaluating. A config error (missing secret, bad CA) is NOT a
+	// monitoring outage — surface it as Degraded and hold; never let it reach decideGate.
+	tr, cfgErr := r.resolveGateTransport(ctx, fr.Namespace, gate)
+	if cfgErr != nil {
+		var ce *gateConfigError
+		reason, msg := "InvalidConfig", cfgErr.Error()
+		if errors.As(cfgErr, &ce) {
+			reason = ce.reason
+		}
+		gateEvaluationsTotal.WithLabelValues("config_error").Inc()
+		setCond(fr, metav1.Condition{
+			Type: strDegraded, Status: metav1.ConditionTrue, Reason: reason, Message: msg,
+		})
+		setCond(fr, metav1.Condition{
+			Type: "HealthGateConfigValid", Status: metav1.ConditionFalse, Reason: reason, Message: msg,
+		})
+		log.Info("health gate config error → holding (not escalating)", "wave", wave, "reason", reason, "msg", msg)
+		return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
+	}
+
+	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, normalizeQueries(gate), tr)
 	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = defaultTimeout
@@ -603,14 +637,14 @@ func decideGate(reachable, healthy, timedOut, onFailure, hasLastGood bool) gateA
 // unparsable body, non-success status, or empty result set makes a query *unanswered* → reachable
 // false → the gate HOLDS (never escalates). This preserves "no data never rolls back" across N
 // queries, and fixes the latent hazard where an empty vector / 5xx used to read as unhealthy.
-func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base string, queries []resolvedQuery) (healthy, reachable bool) {
-	cl := r.HTTP
+func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base string, queries []resolvedQuery, tr gateTransport) (healthy, reachable bool) {
+	cl := tr.client
 	if cl == nil {
 		cl = &http.Client{Timeout: promQLTimeout}
 	}
 	allPass := true
 	for _, q := range queries {
-		pass, answered := r.evalOneQuery(ctx, cl, base, q)
+		pass, answered := r.evalOneQuery(ctx, cl, tr.authHeader, base, q)
 		if !answered {
 			return false, false // any unanswered query → hold
 		}
@@ -627,11 +661,14 @@ const promRespCap = 1 << 20 // 1 MiB
 
 // evalOneQuery runs one instant query. answered = we got a definitive Prometheus answer; pass =
 // answered AND >=1 sample AND every sample satisfies the query's op/threshold.
-func (r *FleetRolloutReconciler) evalOneQuery(ctx context.Context, cl *http.Client, base string, q resolvedQuery) (pass, answered bool) {
+func (r *FleetRolloutReconciler) evalOneQuery(ctx context.Context, cl *http.Client, authHeader, base string, q resolvedQuery) (pass, answered bool) {
 	u := fmt.Sprintf("%s/api/v1/query?query=%s", base, url.QueryEscape(q.query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return false, false
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
 	resp, err := cl.Do(req)
 	if err != nil {

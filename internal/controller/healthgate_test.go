@@ -18,10 +18,18 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	fleetv1alpha1 "github.com/timo-kang/fleetrollout/api/v1alpha1"
 )
 
 // promSuccess builds a Prometheus /api/v1/query success body with one sample per value.
@@ -66,7 +74,7 @@ func TestEvalPromQL(t *testing.T) {
 			defer srv.Close()
 
 			r := &FleetRolloutReconciler{HTTP: srv.Client()}
-			healthy, reachable := r.evalPromQL(context.Background(), srv.URL, gt0(`up == 1`))
+			healthy, reachable := r.evalPromQL(context.Background(), srv.URL, gt0(`up == 1`), gateTransport{client: srv.Client()})
 			if healthy != tt.wantHealthy || reachable != tt.wantReachable {
 				t.Fatalf("evalPromQL = (healthy=%v, reachable=%v), want (healthy=%v, reachable=%v)",
 					healthy, reachable, tt.wantHealthy, tt.wantReachable)
@@ -98,7 +106,7 @@ func TestEvalPromQL_OpThreshold(t *testing.T) {
 			defer srv.Close()
 			r := &FleetRolloutReconciler{HTTP: srv.Client()}
 			q := []resolvedQuery{{query: "err", op: c.op, threshold: c.threshold, name: "err"}}
-			healthy, reachable := r.evalPromQL(context.Background(), srv.URL, q)
+			healthy, reachable := r.evalPromQL(context.Background(), srv.URL, q, gateTransport{client: srv.Client()})
 			if !reachable {
 				t.Fatal("expected reachable")
 			}
@@ -120,7 +128,8 @@ func TestEvalPromQL_MultiQuery(t *testing.T) {
 	// Both healthy → healthy.
 	r := &FleetRolloutReconciler{HTTP: healthySrv.Client()}
 	h, reach := r.evalPromQL(context.Background(), healthySrv.URL,
-		[]resolvedQuery{{query: "a", op: "gt", name: "a"}, {query: "b", op: "gt", name: "b"}})
+		[]resolvedQuery{{query: "a", op: "gt", name: "a"}, {query: "b", op: "gt", name: "b"}},
+		gateTransport{client: healthySrv.Client()})
 	if !h || !reach {
 		t.Errorf("both healthy: got (healthy=%v, reachable=%v), want (true,true)", h, reach)
 	}
@@ -138,7 +147,8 @@ func TestEvalPromQL_MultiQuery(t *testing.T) {
 	defer mixedSrv.Close()
 	r = &FleetRolloutReconciler{HTTP: mixedSrv.Client()}
 	h, reach = r.evalPromQL(context.Background(), mixedSrv.URL,
-		[]resolvedQuery{{query: "good", op: "gt", name: "good"}, {query: "bad", op: "gt", name: "bad"}})
+		[]resolvedQuery{{query: "good", op: "gt", name: "good"}, {query: "bad", op: "gt", name: "bad"}},
+		gateTransport{client: mixedSrv.Client()})
 	if h || reach {
 		t.Errorf("one unreachable query: got (healthy=%v, reachable=%v), want (false,false) HOLD", h, reach)
 	}
@@ -153,15 +163,83 @@ func TestEvalPromQL_OversizedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 	r := &FleetRolloutReconciler{HTTP: srv.Client()}
-	healthy, reachable := r.evalPromQL(context.Background(), srv.URL, gt0("up"))
+	healthy, reachable := r.evalPromQL(context.Background(), srv.URL, gt0("up"), gateTransport{client: srv.Client()})
 	if healthy || reachable {
 		t.Errorf("oversized body: got (healthy=%v, reachable=%v), want (false,false) HOLD", healthy, reachable)
 	}
 }
 
+// TestResolveGateTransport_Auth: bearer/basic credentials from a Secret become the Authorization
+// header; a missing/malformed Secret is a config error (not a monitoring outage).
+func TestResolveGateTransport_Auth(t *testing.T) {
+	s := planTestScheme(t)
+	bearer := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "bear", Namespace: nsDefault},
+		Data: map[string][]byte{"token": []byte("s3cr3t")}}
+	basic := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "basic", Namespace: nsDefault},
+		Data: map[string][]byte{"username": []byte("u"), "password": []byte("p")}}
+	empty := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: nsDefault}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(bearer, basic, empty).Build()
+	r := &FleetRolloutReconciler{Client: c, HTTP: &http.Client{}}
+	gateWith := func(a *fleetv1alpha1.GateAuth) *fleetv1alpha1.HealthGate {
+		return &fleetv1alpha1.HealthGate{PrometheusURL: "http://p:9090", Query: "up", Auth: a}
+	}
+
+	t.Run("bearer", func(t *testing.T) {
+		tr, err := r.resolveGateTransport(context.Background(), nsDefault,
+			gateWith(&fleetv1alpha1.GateAuth{Type: authBearer, SecretRef: corev1.LocalObjectReference{Name: "bear"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tr.authHeader != "Bearer s3cr3t" {
+			t.Errorf("authHeader = %q, want Bearer s3cr3t", tr.authHeader)
+		}
+	})
+	t.Run("basic", func(t *testing.T) {
+		tr, err := r.resolveGateTransport(context.Background(), nsDefault,
+			gateWith(&fleetv1alpha1.GateAuth{Type: authBasic, SecretRef: corev1.LocalObjectReference{Name: "basic"}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tr.authHeader != "Basic "+base64.StdEncoding.EncodeToString([]byte("u:p")) {
+			t.Errorf("basic authHeader wrong: %q", tr.authHeader)
+		}
+	})
+	t.Run("missing secret → config error", func(t *testing.T) {
+		_, err := r.resolveGateTransport(context.Background(), nsDefault,
+			gateWith(&fleetv1alpha1.GateAuth{Type: authBearer, SecretRef: corev1.LocalObjectReference{Name: "nope"}}))
+		var ce *gateConfigError
+		if !errors.As(err, &ce) || ce.reason != "AuthSecretNotFound" {
+			t.Errorf("want AuthSecretNotFound config error, got %v", err)
+		}
+	})
+	t.Run("empty token → config error", func(t *testing.T) {
+		_, err := r.resolveGateTransport(context.Background(), nsDefault,
+			gateWith(&fleetv1alpha1.GateAuth{Type: authBearer, SecretRef: corev1.LocalObjectReference{Name: "empty"}}))
+		var ce *gateConfigError
+		if !errors.As(err, &ce) || ce.reason != "AuthSecretMalformed" {
+			t.Errorf("want AuthSecretMalformed, got %v", err)
+		}
+	})
+}
+
+// TestEvalPromQL_AuthHeaderSent: the resolved auth header is actually attached to the request.
+func TestEvalPromQL_AuthHeaderSent(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotAuth = req.Header.Get("Authorization")
+		_, _ = w.Write([]byte(promSuccess("1")))
+	}))
+	defer srv.Close()
+	r := &FleetRolloutReconciler{HTTP: srv.Client()}
+	r.evalPromQL(context.Background(), srv.URL, gt0("up"), gateTransport{client: srv.Client(), authHeader: "Bearer abc"})
+	if gotAuth != "Bearer abc" {
+		t.Errorf("Authorization header = %q, want Bearer abc", gotAuth)
+	}
+}
+
 func TestEvalPromQL_Unreachable(t *testing.T) {
 	r := &FleetRolloutReconciler{HTTP: &http.Client{}}
-	healthy, reachable := r.evalPromQL(context.Background(), "http://127.0.0.1:1", gt0(`up`))
+	healthy, reachable := r.evalPromQL(context.Background(), "http://127.0.0.1:1", gt0(`up`), gateTransport{client: r.HTTP})
 	if healthy || reachable {
 		t.Fatalf("unreachable target: got (healthy=%v, reachable=%v), want (false,false)", healthy, reachable)
 	}
