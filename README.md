@@ -39,6 +39,33 @@ spec:
     timeoutSeconds: 300
 ```
 
+<details>
+<summary>Advanced health gate — multiple checks, thresholds, auth/TLS, per-wave scoping</summary>
+
+```yaml
+  healthGate:
+    prometheusURL: https://thanos.monitoring:9091
+    auth:                         # bearer or basic, from a Secret in this namespace
+      type: bearer                #   key "token" (bearer) or "username"/"password" (basic)
+      secretRef: { name: prom-auth }
+    tls:
+      caRef: { kind: ConfigMap, name: prom-ca }   # key "ca.crt"
+      serverName: thanos.monitoring
+    timeoutSeconds: 300
+    queries:                      # ALL must pass; ANY unanswered → HOLD (never rolls back)
+      - query: 'min(up{job="camera-agent",node=~"({{ .WaveNodes }})"})'   # scope to THIS wave's nodes
+        op: ge
+        threshold: "1"
+      - query: 'sum(rate(agent_errors_total{node=~"({{ .WaveNodes }})"}[5m]))'
+        op: lt
+        threshold: "0.01"         # error rate below 1% — no inversion gymnastics
+```
+
+Template vars: `{{ .WaveNodes }}` (regex alternation of the wave's node names), `{{ .Wave }}`,
+`{{ .Image }}`, `{{ .TemplateHash }}`. A missing/garbled secret, bad CA, or malformed template
+surfaces as `Degraded` / `HealthGateConfigValid=False` and **holds** — it never rolls back.
+</details>
+
 ```
 $ kubectl get fleetrollout
 NAME           PHASE         WAVE   UPDATED   AGE
@@ -76,7 +103,9 @@ flowchart TD
 - [x] MVP reconcile: wave partitioning + readiness-based promotion (level-based, `OnDelete`)
 - [x] PromQL health gate (gated wave promotion) + automatic rollback (`OnFailure` → last-good)
 - [x] Node watch, unit tests, kind e2e, Helm chart
-- [ ] Offline-node re-join convergence; envtest; richer gates (thresholds, multi-query)
+- [x] Rich health gates: multi-query + operators/thresholds, bearer/basic auth + TLS, per-wave templating
+- [x] `spec.template` (full pod), schedulingGates wave control, custom metrics, GHCR release
+- [ ] Rollout history in status; conversion to v1beta1
 
 ## Install
 

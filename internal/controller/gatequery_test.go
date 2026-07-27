@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -70,5 +71,56 @@ func TestNormalizeQueries(t *testing.T) {
 	// Quantity → float is approximate (0.95 ≈ 0.9500000000000001); compare with tolerance.
 	if got[1].op != "lt" || got[1].threshold < 0.9499 || got[1].threshold > 0.9501 {
 		t.Errorf("q1 explicit wrong: op=%q threshold=%v (want lt/~0.95)", got[1].op, got[1].threshold)
+	}
+}
+
+func TestWaveNodesRegex(t *testing.T) {
+	nodes := []string{"n1.edge", "n2", "n3", "n4"}
+	// waveSize 2 → wave 0 = n1,n2; wave 1 = n3,n4. Dots are escaped (regex-inert).
+	if got := waveNodesRegex(nodes, 2, 0); got != `n1\.edge|n2` {
+		t.Errorf("wave 0 = %q, want n1\\.edge|n2", got)
+	}
+	if got := waveNodesRegex(nodes, 2, 1); got != "n3|n4" {
+		t.Errorf("wave 1 = %q, want n3|n4", got)
+	}
+	// Out-of-range wave → empty.
+	if got := waveNodesRegex(nodes, 2, 9); got != "" {
+		t.Errorf("out-of-range wave = %q, want empty", got)
+	}
+}
+
+func TestRenderQueries(t *testing.T) {
+	tc := gateTemplateContext{WaveNodes: "n1|n2", Wave: 1, Image: "img:v2", TemplateHash: "abc"}
+
+	// Happy path: variables expand; plain text passes through.
+	out, err := renderQueries([]resolvedQuery{
+		{query: `up{node=~"({{.WaveNodes}})"}`, name: "a"},
+		{query: `rate(err{wave="{{.Wave}}"}[5m])`, name: "b"},
+		{query: `plain_no_template`, name: "c"},
+	}, tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0].query != `up{node=~"(n1|n2)"}` {
+		t.Errorf("q0 = %q", out[0].query)
+	}
+	if out[1].query != `rate(err{wave="1"}[5m])` {
+		t.Errorf("q1 = %q", out[1].query)
+	}
+	if out[2].query != `plain_no_template` {
+		t.Errorf("q2 = %q", out[2].query)
+	}
+
+	// Unknown variable → config error (not a hold).
+	_, err = renderQueries([]resolvedQuery{{query: `{{.Nope}}`, name: "x"}}, tc)
+	var ce *gateConfigError
+	if !errors.As(err, &ce) || ce.reason != "TemplateInvalid" {
+		t.Errorf("unknown var: want TemplateInvalid config error, got %v", err)
+	}
+
+	// Malformed template → config error.
+	_, err = renderQueries([]resolvedQuery{{query: `{{.WaveNodes`, name: "y"}}, tc)
+	if !errors.As(err, &ce) || ce.reason != "TemplateInvalid" {
+		t.Errorf("malformed: want TemplateInvalid config error, got %v", err)
 	}
 }

@@ -17,6 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"regexp"
+	"strings"
+	"text/template"
+
 	fleetv1alpha1 "github.com/timo-kang/fleetrollout/api/v1alpha1"
 )
 
@@ -45,6 +49,53 @@ func compare(value float64, op string, threshold float64) bool {
 	default: // "gt" and anything unrecognized
 		return value > threshold
 	}
+}
+
+// gateTemplateContext is the variable set available to per-wave gate query templates. It lets a
+// wave's gate select only its own nodes (so it isn't diluted by the not-yet-updated fleet).
+type gateTemplateContext struct {
+	WaveNodes    string // current wave's node names as a regex alternation "n1|n2" (for PromQL =~)
+	Wave         int    // current wave index (0-based)
+	Image        string // image under rollout
+	TemplateHash string // current template hash
+}
+
+// waveNodesRegex renders the given wave's node names as a regex alternation, each name escaped so
+// dots etc. are literal. Node names are DNS-1123 (no quotes), so PromQL string quoting is safe.
+func waveNodesRegex(nodes []string, waveSize, wave int) string {
+	if waveSize < 1 {
+		waveSize = 1
+	}
+	start := wave * waveSize
+	end := min(start+waveSize, len(nodes))
+	if start >= len(nodes) || start < 0 {
+		return ""
+	}
+	escaped := make([]string, 0, end-start)
+	for _, n := range nodes[start:end] {
+		escaped = append(escaped, regexp.QuoteMeta(n))
+	}
+	return strings.Join(escaped, "|")
+}
+
+// renderQueries expands each query as a Go text/template against tc, before URL-escaping. A
+// malformed template or unknown variable is a config error (surfaced as Degraded, never a hold on
+// bad data). Plain queries with no {{ }} pass through unchanged.
+func renderQueries(queries []resolvedQuery, tc gateTemplateContext) ([]resolvedQuery, error) {
+	out := make([]resolvedQuery, len(queries))
+	for i, q := range queries {
+		tmpl, err := template.New("gate").Option("missingkey=error").Parse(q.query)
+		if err != nil {
+			return nil, configErr("TemplateInvalid", "gate query %q: %v", q.name, err)
+		}
+		var b strings.Builder
+		if err := tmpl.Execute(&b, tc); err != nil {
+			return nil, configErr("TemplateInvalid", "gate query %q: %v", q.name, err)
+		}
+		q.query = b.String()
+		out[i] = q
+	}
+	return out, nil
 }
 
 // normalizeQueries reduces a HealthGate to a flat list of resolvedQuery, applying defaults. A bare

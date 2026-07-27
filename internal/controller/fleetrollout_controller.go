@@ -514,6 +514,25 @@ type gateDecision struct {
 	res      ctrl.Result
 }
 
+// onGateConfigError surfaces a health-gate misconfiguration as Degraded and holds — a config error
+// (bad secret/CA/template) must never reach decideGate, so it can't be turned into a rollback.
+func (r *FleetRolloutReconciler) onGateConfigError(fr *fleetv1alpha1.FleetRollout, log logr, wave int, err error) gateDecision {
+	var ce *gateConfigError
+	reason, msg := "InvalidConfig", err.Error()
+	if errors.As(err, &ce) {
+		reason = ce.reason
+	}
+	gateEvaluationsTotal.WithLabelValues("config_error").Inc()
+	setCond(fr, metav1.Condition{
+		Type: strDegraded, Status: metav1.ConditionTrue, Reason: reason, Message: msg,
+	})
+	setCond(fr, metav1.Condition{
+		Type: "HealthGateConfigValid", Status: metav1.ConditionFalse, Reason: reason, Message: msg,
+	})
+	log.Info("health gate config error → holding (not escalating)", "wave", wave, "reason", reason, "msg", msg)
+	return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
+}
+
 // gate evaluates (and latches) the health gate for a completed wave against the plan snapshot.
 // A passed gate is recorded as plan.GatedWaves (high-water mark), so the latch is bound to the
 // exact node set the plan froze — flapping nodes cannot re-authorize a different set (C2).
@@ -531,27 +550,25 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		plan.GateStartedAt = &now
 	}
 
-	// Resolve auth/TLS BEFORE evaluating. A config error (missing secret, bad CA) is NOT a
-	// monitoring outage — surface it as Degraded and hold; never let it reach decideGate.
-	tr, cfgErr := r.resolveGateTransport(ctx, fr.Namespace, gate)
-	if cfgErr != nil {
-		var ce *gateConfigError
-		reason, msg := "InvalidConfig", cfgErr.Error()
-		if errors.As(cfgErr, &ce) {
-			reason = ce.reason
+	// Resolve auth/TLS and render per-wave query templates BEFORE evaluating. A config error
+	// (missing secret, bad CA, malformed template) is NOT a monitoring outage — surface it as
+	// Degraded and hold; never let it reach decideGate (a config mistake must not roll back).
+	tr, err := r.resolveGateTransport(ctx, fr.Namespace, gate)
+	var queries []resolvedQuery
+	if err == nil {
+		tc := gateTemplateContext{
+			WaveNodes:    waveNodesRegex(plan.Nodes, int(plan.WaveSize), wave),
+			Wave:         wave,
+			Image:        plan.Image,
+			TemplateHash: plan.TemplateHash,
 		}
-		gateEvaluationsTotal.WithLabelValues("config_error").Inc()
-		setCond(fr, metav1.Condition{
-			Type: strDegraded, Status: metav1.ConditionTrue, Reason: reason, Message: msg,
-		})
-		setCond(fr, metav1.Condition{
-			Type: "HealthGateConfigValid", Status: metav1.ConditionFalse, Reason: reason, Message: msg,
-		})
-		log.Info("health gate config error → holding (not escalating)", "wave", wave, "reason", reason, "msg", msg)
-		return gateDecision{res: ctrl.Result{RequeueAfter: requeueGate}}
+		queries, err = renderQueries(normalizeQueries(gate), tc)
+	}
+	if err != nil {
+		return r.onGateConfigError(fr, log, wave, err)
 	}
 
-	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, normalizeQueries(gate), tr)
+	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, queries, tr)
 	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = defaultTimeout

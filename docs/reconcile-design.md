@@ -291,7 +291,7 @@ Emit Kubernetes Events (`recorder.Event`) at: wave promotion, gate pass/fail, ro
 
 * `spec.paused` field and a real user-facing pause/resume (MVP `Paused` is only the gate-failure-with-`Never` parking state).
 * Gating the *initial* deployment (first rollout onto empty nodes goes fleet-wide at once under Option B; fix via "create DS with pause-image/last-good first" or per-node scheduling gates).
-* Rich health gate: comparison operators, thresholds, multiple queries, per-wave queries with label templating (`{{.wave}}`), Prometheus auth/TLS.
+* ~~Rich health gate: comparison operators, thresholds, multiple queries, per-wave queries with label templating, Prometheus auth/TLS.~~ **Done (v0.3):** `queries[]` with per-query op/threshold (ANDed), bearer/basic auth + custom CA/TLS from Secrets/ConfigMaps, and `text/template` per-wave scoping (`{{.WaveNodes}}` etc.). Config errors (bad secret/CA/template) hold as `Degraded` instead of escalating.
 * Wave-by-wave rollback, partial rollback, `maxUnavailable` within a wave, canary hold times / soak duration between waves.
 * Handling stuck-terminating pods (force policy), per-node timeout/skip budget (`maxSkewedNodes`).
 * ~~Multiple containers / full pod template in spec.~~ **Done (v0.3):** `spec.template` accepts a full `PodTemplateSpec`; `spec.image` remains as shorthand for a single-container template. Rollout identity is a hash of the rendered base template, so any field change re-rolls.

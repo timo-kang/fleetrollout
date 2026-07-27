@@ -272,3 +272,44 @@ func TestDecideGate(t *testing.T) {
 		})
 	}
 }
+
+// TestGateTemplatingRendersWaveNodes: a {{.WaveNodes}} gate query reaches Prometheus with the
+// current wave's node names substituted (proving render happens before URL-escape, in the gate).
+func TestGateTemplatingRendersWaveNodes(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotQuery = req.URL.Query().Get("query")
+		_, _ = w.Write([]byte(promSuccess("1")))
+	}))
+	defer srv.Close()
+
+	fr := &fleetv1alpha1.FleetRollout{
+		ObjectMeta: metav1.ObjectMeta{Namespace: nsDefault, Generation: 1},
+		Spec: fleetv1alpha1.FleetRolloutSpec{
+			HealthGate: &fleetv1alpha1.HealthGate{
+				PrometheusURL:  srv.URL,
+				Query:          `up{node=~"({{.WaveNodes}})"}`,
+				TimeoutSeconds: 60,
+			},
+		},
+		Status: fleetv1alpha1.FleetRolloutStatus{
+			Plan: &fleetv1alpha1.RolloutPlan{
+				TemplateHash: "h", Image: frImage, Generation: 1, WaveSize: 2,
+				Nodes: []string{"n1", "n2", "n3", "n4"},
+			},
+		},
+	}
+	r := &FleetRolloutReconciler{HTTP: srv.Client()}
+	// Gate wave 1 → its nodes are n3,n4.
+	d := r.gate(context.Background(), testLogger{}, fr, 1)
+	if !d.promote {
+		t.Fatalf("expected promote, got %+v", d)
+	}
+	if gotQuery != `up{node=~"(n3|n4)"}` {
+		t.Errorf("prometheus received query %q, want up{node=~\"(n3|n4)\"}", gotQuery)
+	}
+}
+
+type testLogger struct{}
+
+func (testLogger) Info(string, ...any) {}
