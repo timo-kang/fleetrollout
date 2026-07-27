@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -159,7 +160,7 @@ var _ = Describe("FleetRollout Controller", func() {
 			}, true),
 			Entry("negative timeout", func(fr *fleetv1alpha1.FleetRollout) {
 				fr.Spec.Image = frImage
-				fr.Spec.HealthGate = gate("http://p:9090", "up", -5)
+				fr.Spec.HealthGate = gate(promTestURL, "up", -5)
 			}, false),
 			Entry("ftp prometheusURL (SSRF)", func(fr *fleetv1alpha1.FleetRollout) {
 				fr.Spec.Image = frImage
@@ -168,6 +169,35 @@ var _ = Describe("FleetRollout Controller", func() {
 			Entry("valid https healthGate", func(fr *fleetv1alpha1.FleetRollout) {
 				fr.Spec.Image = frImage
 				fr.Spec.HealthGate = gate("https://p:9090", "up", 60)
+			}, true),
+			Entry("both query and queries", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = &fleetv1alpha1.HealthGate{
+					PrometheusURL: promTestURL, Query: "up",
+					Queries: []fleetv1alpha1.GateQuery{{Query: "up"}},
+				}
+			}, false),
+			Entry("neither query nor queries", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = &fleetv1alpha1.HealthGate{PrometheusURL: promTestURL}
+			}, false),
+			Entry("queries with bad op enum", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				fr.Spec.HealthGate = &fleetv1alpha1.HealthGate{
+					PrometheusURL: promTestURL,
+					Queries:       []fleetv1alpha1.GateQuery{{Query: "up", Op: opBogus}},
+				}
+			}, false),
+			Entry("valid multi-query with op/threshold", func(fr *fleetv1alpha1.FleetRollout) {
+				fr.Spec.Image = frImage
+				thr := resource.MustParse("0.01")
+				fr.Spec.HealthGate = &fleetv1alpha1.HealthGate{
+					PrometheusURL: "https://p:9090",
+					Queries: []fleetv1alpha1.GateQuery{
+						{Query: "up", Op: "gt"},
+						{Query: "rate(err[5m])", Op: "lt", Threshold: &thr},
+					},
+				}
 			}, true),
 		)
 	})

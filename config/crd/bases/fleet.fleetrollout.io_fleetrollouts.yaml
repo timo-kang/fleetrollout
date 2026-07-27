@@ -69,9 +69,59 @@ spec:
                     x-kubernetes-validations:
                     - message: prometheusURL must start with http:// or https://
                       rule: self.startsWith('http://') || self.startsWith('https://')
+                  queries:
+                    description: |-
+                      queries is a set of PromQL checks; the gate is healthy only when ALL of them pass, and holds
+                      (never rolls back) if ANY of them cannot be definitively answered. Mutually exclusive with query.
+                    items:
+                      description: |-
+                        GateQuery is one PromQL check: the wave is healthy for this query when it returns at least one
+                        sample and EVERY sample value satisfies `value <op> threshold`.
+                      properties:
+                        name:
+                          description: name is an optional label for this query, surfaced
+                            in conditions/events; defaults to its index.
+                          maxLength: 63
+                          type: string
+                        op:
+                          default: gt
+                          description: |-
+                            op is the comparison every sample value must satisfy against threshold:
+                            gt (>), ge (>=), lt (<), le (<=), eq (==), ne (!=). Defaults to gt.
+                          enum:
+                          - gt
+                          - ge
+                          - lt
+                          - le
+                          - eq
+                          - ne
+                          type: string
+                        query:
+                          description: query is the PromQL expression to evaluate
+                            as an instant query.
+                          minLength: 1
+                          type: string
+                        threshold:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          default: "0"
+                          description: |-
+                            threshold is the value each sample is compared against (a decimal quantity, e.g. "0", "0.95",
+                            "-1"). Defaults to "0", so with the default op gt this is the classic "every sample > 0".
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - query
+                      type: object
+                    maxItems: 8
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
                   query:
-                    description: query is a PromQL expression; the wave is healthy
-                      when it returns a truthy, non-empty result.
+                    description: |-
+                      query is a single PromQL check — shorthand for queries: [{query: <q>, op: gt, threshold: "0"}]
+                      (healthy when every returned sample is > 0). Mutually exclusive with queries.
                     minLength: 1
                     type: string
                   timeoutSeconds:
@@ -85,8 +135,11 @@ spec:
                     type: integer
                 required:
                 - prometheusURL
-                - query
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of healthGate.query or healthGate.queries must
+                    be set
+                  rule: has(self.query) != has(self.queries)
               image:
                 description: |-
                   image is shorthand for a minimal single-container pod template (container name "agent")

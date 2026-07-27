@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -516,7 +517,7 @@ func (r *FleetRolloutReconciler) gate(ctx context.Context, log logr, fr *fleetv1
 		plan.GateStartedAt = &now
 	}
 
-	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, gate.Query)
+	healthy, reachable := r.evalPromQL(ctx, gate.PrometheusURL, normalizeQueries(gate))
 	timeout := time.Duration(gate.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = defaultTimeout
@@ -596,13 +597,38 @@ func decideGate(reachable, healthy, timedOut, onFailure, hasLastGood bool) gateA
 	return gatePauseTimeout
 }
 
-// evalPromQL runs an instant query; healthy = >=1 sample and every sample value > 0.
-func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query string) (healthy, reachable bool) {
+// evalPromQL evaluates every query and aggregates to the (healthy, reachable) contract decideGate
+// consumes. reachable is true only if EVERY query was definitively answered; healthy is true only
+// if reachable AND every query passed its op/threshold. Any transport error, non-2xx, oversized or
+// unparsable body, non-success status, or empty result set makes a query *unanswered* → reachable
+// false → the gate HOLDS (never escalates). This preserves "no data never rolls back" across N
+// queries, and fixes the latent hazard where an empty vector / 5xx used to read as unhealthy.
+func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base string, queries []resolvedQuery) (healthy, reachable bool) {
 	cl := r.HTTP
 	if cl == nil {
 		cl = &http.Client{Timeout: promQLTimeout}
 	}
-	u := fmt.Sprintf("%s/api/v1/query?query=%s", base, url.QueryEscape(query))
+	allPass := true
+	for _, q := range queries {
+		pass, answered := r.evalOneQuery(ctx, cl, base, q)
+		if !answered {
+			return false, false // any unanswered query → hold
+		}
+		if !pass {
+			allPass = false
+		}
+	}
+	return allPass, true
+}
+
+// promRespCap bounds the health-gate response body read (a healthy instant query is a few hundred
+// bytes); a larger body is treated as unanswered rather than risking an OOM on a hostile response.
+const promRespCap = 1 << 20 // 1 MiB
+
+// evalOneQuery runs one instant query. answered = we got a definitive Prometheus answer; pass =
+// answered AND >=1 sample AND every sample satisfies the query's op/threshold.
+func (r *FleetRolloutReconciler) evalOneQuery(ctx context.Context, cl *http.Client, base string, q resolvedQuery) (pass, answered bool) {
+	u := fmt.Sprintf("%s/api/v1/query?query=%s", base, url.QueryEscape(q.query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return false, false
@@ -613,7 +639,13 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return false, true
+		return false, false
+	}
+	// Cap the body: read up to promRespCap+1; if we hit the extra byte, it's oversized → unanswered.
+	lim := io.LimitReader(resp.Body, promRespCap+1)
+	body, err := io.ReadAll(lim)
+	if err != nil || len(body) > promRespCap {
+		return false, false
 	}
 	var pr struct {
 		Status string `json:"status"`
@@ -623,23 +655,26 @@ func (r *FleetRolloutReconciler) evalPromQL(ctx context.Context, base, query str
 			} `json:"result"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return false, true
+	if err := json.Unmarshal(body, &pr); err != nil || pr.Status != "success" {
+		return false, false
 	}
-	if pr.Status != "success" || len(pr.Data.Result) == 0 {
-		return false, true
+	if len(pr.Data.Result) == 0 {
+		return false, false // empty vector = no data → unanswered → hold (not "unhealthy")
 	}
 	for _, s := range pr.Data.Result {
 		if len(s.Value) != 2 {
-			return false, true
+			return false, false
 		}
 		str, ok := s.Value[1].(string)
 		if !ok {
-			return false, true
+			return false, false
 		}
 		v, err := strconv.ParseFloat(str, 64)
-		if err != nil || v <= 0 {
-			return false, true
+		if err != nil {
+			return false, false
+		}
+		if !compare(v, q.op, q.threshold) {
+			return false, true // definitively answered, but this sample fails the threshold
 		}
 	}
 	return true, true

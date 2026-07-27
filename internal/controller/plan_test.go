@@ -42,6 +42,8 @@ const (
 	lastGoodImg   = "img:v0"
 	fleetGroupKey = "fleet-group"
 	fleetGroupVal = "field-robots"
+	promTestURL   = "http://p:9090"
+	opBogus       = "bogus"
 )
 
 // planTestScheme builds a scheme with the FleetRollout + core/apps types registered.

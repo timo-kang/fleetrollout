@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -69,7 +70,9 @@ type FleetRolloutSpec struct {
 	RollbackPolicy RollbackPolicy `json:"rollbackPolicy,omitempty"`
 }
 
-// HealthGate is a promotion gate evaluated between waves.
+// HealthGate is a promotion gate evaluated between waves. Provide exactly one of query (a single
+// PromQL check) or queries (several checks, all of which must pass).
+// +kubebuilder:validation:XValidation:rule="has(self.query) != has(self.queries)",message="exactly one of healthGate.query or healthGate.queries must be set"
 type HealthGate struct {
 	// prometheusURL is the base URL of the Prometheus server to query. Must be http(s) — the scheme
 	// is allowlisted to blunt SSRF (a FleetRollout author would otherwise make the controller GET an
@@ -78,10 +81,19 @@ type HealthGate struct {
 	// +required
 	PrometheusURL string `json:"prometheusURL"`
 
-	// query is a PromQL expression; the wave is healthy when it returns a truthy, non-empty result.
+	// query is a single PromQL check — shorthand for queries: [{query: <q>, op: gt, threshold: "0"}]
+	// (healthy when every returned sample is > 0). Mutually exclusive with queries.
 	// +kubebuilder:validation:MinLength=1
-	// +required
-	Query string `json:"query"`
+	// +optional
+	Query string `json:"query,omitempty"`
+
+	// queries is a set of PromQL checks; the gate is healthy only when ALL of them pass, and holds
+	// (never rolls back) if ANY of them cannot be definitively answered. Mutually exclusive with query.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +listType=atomic
+	// +optional
+	Queries []GateQuery `json:"queries,omitempty"`
 
 	// timeoutSeconds is how long to wait for the gate to pass before failing the wave (0 = default
 	// 300s). Negative values are rejected — they would make the gate time out instantly and, under
@@ -90,6 +102,33 @@ type HealthGate struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+}
+
+// GateQuery is one PromQL check: the wave is healthy for this query when it returns at least one
+// sample and EVERY sample value satisfies `value <op> threshold`.
+type GateQuery struct {
+	// query is the PromQL expression to evaluate as an instant query.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Query string `json:"query"`
+
+	// op is the comparison every sample value must satisfy against threshold:
+	// gt (>), ge (>=), lt (<), le (<=), eq (==), ne (!=). Defaults to gt.
+	// +kubebuilder:validation:Enum=gt;ge;lt;le;eq;ne
+	// +kubebuilder:default=gt
+	// +optional
+	Op string `json:"op,omitempty"`
+
+	// threshold is the value each sample is compared against (a decimal quantity, e.g. "0", "0.95",
+	// "-1"). Defaults to "0", so with the default op gt this is the classic "every sample > 0".
+	// +kubebuilder:default="0"
+	// +optional
+	Threshold *resource.Quantity `json:"threshold,omitempty"`
+
+	// name is an optional label for this query, surfaced in conditions/events; defaults to its index.
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Name string `json:"name,omitempty"`
 }
 
 // RollbackPolicy controls automatic rollback behavior on wave failure.
